@@ -99,6 +99,19 @@ public class DefaultStreamContext implements StreamContext {
         return stageName;
     }
 
+    /** Set by {@link #resumedFromArtifact}; read by the pipeline straight after the wrap call. */
+    private boolean resumed;
+
+    @Override
+    public void resumedFromArtifact() {
+        this.resumed = true;
+    }
+
+    /** Whether this stage said it short-circuited to an existing artifact. */
+    public boolean hasResumedFromArtifact() {
+        return resumed;
+    }
+
     @Override
     public Path workspace() {
         if (!mayUseWorkspace) {
@@ -107,8 +120,10 @@ public class DefaultStreamContext implements StreamContext {
                     + " write durable files");
         }
         if (workspace == null) {
-            throw new UnsupportedOperationException("operator '" + stageName + "' declared it needs a"
-                    + " workspace, but workspace support is not implemented yet");
+            throw new IllegalStateException("operator '" + stageName + "' needs a workspace but none"
+                    + " is configured; set '" + org.apache.synapse.SynapseConstants.STREAM_WORKSPACE_ROOT
+                    + "' in synapse.properties. A pipeline that materialises is rejected at deployment"
+                    + " for this, so reaching here means the pipeline was assembled programmatically");
         }
         return workspace;
     }

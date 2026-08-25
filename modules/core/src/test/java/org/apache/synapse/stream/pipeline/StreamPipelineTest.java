@@ -179,13 +179,44 @@ public class StreamPipelineTest {
         assertRejected(p, "requires an explicit name");
     }
 
+    /**
+     * Materialisation works now, but only with somewhere to write. Checked at deployment for the same
+     * reason the structure is: an absent mount or a permissions mistake should fail where someone is
+     * looking, not hours into a transfer.
+     */
     @Test
-    public void rejectsMaterialisationUntilWorkspaceSupportExists() {
+    public void rejectsMaterialisationWhenNoWorkspaceIsConfigured() {
         StreamPipeline p = pipeline("mat");
         p.addOperator(new Mocks.Source("src", DATA), true);
-        p.addOperator(new Mocks.Materialising("mat"), true);
+        p.addOperator(new Mocks.LazyMaterialising("mat"), true);
+        try {
+            p.validate();
+            fail("expected a materialising operator with no workspace to be rejected");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("nowhere to write"));
+            assertTrue("it should name the property: " + e.getMessage(),
+                    e.getMessage().contains("mft.workspace.root"));
+        }
+    }
+
+    /**
+     * Checkpointing is still unimplemented, and is now rejected on its own rather than dragging
+     * materialisation down with it — the two need different things, and only one of them needs a
+     * database.
+     */
+    @Test
+    public void rejectsCheckpointingUntilStorageExists() {
+        StreamPipeline p = pipeline("ckpt");
+        p.setWorkspaceRoot("/tmp");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.Checkpointing("ckpt"), true);
         p.addOperator(new Mocks.Sink("sink"), true);
-        assertRejected(p, "not implemented yet");
+        try {
+            p.validate();
+            fail("expected a checkpointed operator to be rejected");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("checkpoint storage is not implemented"));
+        }
     }
 
     // ------------------------------------------------------------------ source modes
@@ -489,18 +520,14 @@ public class StreamPipelineTest {
      * temporary workspace gate — which is how we can tell the terminal rule accepted it.
      */
     @Test
-    public void acceptsATerminalMaterialisingTransform() {
+    public void acceptsATerminalMaterialisingTransform() throws Exception {
         StreamPipeline p = pipeline("terminal-mat");
+        p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
         p.addOperator(new Mocks.Source("src", DATA), true);
         p.addOperator(new Mocks.LazyMaterialising("forEach"), true);
 
-        try {
-            p.validate();
-            fail("expected the temporary workspace gate to trip");
-        } catch (StreamException e) {
-            assertTrue("it must get past the terminal rule, not be rejected by it: " + e.getMessage(),
-                    e.getMessage().contains("not implemented yet"));
-        }
+        // Valid outright now: a materialising transform may end a pipeline, and the pipeline drains it.
+        p.validate();
     }
 
     @Test
@@ -808,5 +835,48 @@ public class StreamPipelineTest {
         } catch (IllegalArgumentException e) {
             assertTrue(e.getMessage(), e.getMessage().contains("at least 1"));
         }
+    }
+
+    // ------------------------------------------------------------------ resume from an artifact
+
+    /**
+     * Invariant 2: the build loop never skips an operator, so on a resumed run the upstream a
+     * materialising stage ignores has still been constructed. It costs nothing to have built — open()
+     * and wrap() do no I/O — but it must not be held for the length of the run, which is what
+     * closeNow() is for. Until now nothing called it.
+     */
+    @Test
+    public void releasesTheUpstreamAStageResumedPast() throws Exception {
+        byte[] artifact = "from-a-previous-run".getBytes(StandardCharsets.UTF_8);
+        Mocks.Source source = new Mocks.Source("src", DATA);
+        Mocks.Sink sink = new Mocks.Sink("sink");
+
+        StreamPipeline p = pipeline("resumed");
+        p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+        p.addOperator(source, true);
+        p.addOperator(new Mocks.ResumesFromArtifact("mat", artifact), true);
+        p.addOperator(sink, true);
+        p.validate();
+
+        p.execute(null, jobWithId("resume-test"));
+
+        assertArrayEquals("the sink must read the artifact, not the source", artifact, sink.bytes());
+        assertEquals("the source was built, as invariant 2 requires", 1, source.opens.get());
+        assertEquals("but never read", 0, source.opened.reads.get());
+    }
+
+    /** A stage that says nothing keeps its upstream, exactly as before. */
+    @Test
+    public void anOrdinaryStageKeepsItsUpstream() throws Exception {
+        Mocks.Sink sink = new Mocks.Sink("sink");
+        StreamPipeline p = pipeline("ordinary");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.PassThrough("pass"), true);
+        p.addOperator(sink, true);
+        p.validate();
+
+        p.execute(null, JobContext.NOOP);
+
+        assertArrayEquals(DATA, sink.bytes());
     }
 }

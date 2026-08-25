@@ -199,6 +199,13 @@ public final class SynapseConstants {
         /** Artifact type used in formatted log lines: {@code {streamPipeline:name} …}. */
         public static final String STREAM_PIPELINE_TYPE = "streamPipeline";
 
+        /**
+         * Root directory under which a run's materialised artifacts are written, from
+         * synapse.properties. Absent means materialisation is not permitted, and a pipeline needing
+         * it is rejected at deployment rather than failing hours into a transfer.
+         */
+        public static final String STREAM_WORKSPACE_ROOT = "mft.workspace.root";
+
     //- Synapse Message Context Properties -
         /** The Synapse MC property keep the response state */
         public static final String RESPONSE_STATE = "__SYNAPSE_RESPONSE_STATE__";

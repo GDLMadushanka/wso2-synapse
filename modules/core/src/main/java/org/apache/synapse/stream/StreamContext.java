@@ -101,4 +101,36 @@ public interface StreamContext {
      *                               {@link StreamOperator#checkpointed()}
      */
     CheckpointStore checkpointStore();
+
+    /**
+     * The canonical file this stage materialises to, {@code <workspace>/artifact.out}.
+     *
+     * <p>Framework-defined rather than operator-chosen, and that matters: restart decides what is
+     * already done by looking for this file, so if an operator picked its own name the pipeline would
+     * be guessing. Both sides call this method, so they cannot diverge.
+     *
+     * <p>Write to a temporary name and rename onto this one. A partial file visible here would be read
+     * by a later run as a finished segment.
+     *
+     * @return the artifact path for this stage
+     * @throws IllegalStateException if this operator declared neither {@code materialises()} nor
+     *                               {@code checkpointed()}
+     */
+    default Path artifact() {
+        return workspace().resolve("artifact.out");
+    }
+
+    /**
+     * Tells the pipeline this stage produced its output from an artifact a previous run left behind,
+     * so nothing built above it will ever be read.
+     *
+     * <p>Call it from {@code wrap()} when {@link #artifact()} already exists and you return a stream
+     * over it instead of over your upstream. The pipeline then releases that upstream immediately
+     * rather than holding a connection, unused, for the length of the run — the orphan
+     * {@code ResourceScope.closeNow} exists for.
+     *
+     * <p>Saying nothing is safe: the upstream is simply held until the run ends, as before.
+     */
+    default void resumedFromArtifact() {
+    }
 }

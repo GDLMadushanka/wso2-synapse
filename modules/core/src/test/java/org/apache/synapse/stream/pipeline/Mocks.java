@@ -92,6 +92,62 @@ final class Mocks {
         }
     }
 
+    /**
+     * A materialising transform that finds its artifact already there and returns a stream over it,
+     * ignoring its upstream — the resume shape ADR-0013 describes.
+     */
+    static final class ResumesFromArtifact implements StreamTransform {
+
+        private final String name;
+        private final byte[] artifact;
+
+        ResumesFromArtifact(String name, byte[] artifact) {
+            this.name = name;
+            this.artifact = artifact;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public boolean materialises() {
+            return true;
+        }
+
+        @Override
+        public InputStream wrap(InputStream in, StreamContext ctx) {
+            ctx.resumedFromArtifact();
+            return new java.io.ByteArrayInputStream(artifact);
+        }
+    }
+
+    /** A transform that declares it keeps a durable position, for the validation rules. */
+    static final class Checkpointing implements StreamTransform {
+
+        private final String name;
+
+        Checkpointing(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public boolean checkpointed() {
+            return true;
+        }
+
+        @Override
+        public InputStream wrap(InputStream in, StreamContext ctx) {
+            return new java.io.FilterInputStream(in) { };
+        }
+    }
+
     /** A source whose bytes exist once — an API multipart body or a socket. */
     static final class OneShotSource implements StreamSource {
 

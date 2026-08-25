@@ -24,6 +24,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.ManagedLifecycle;
 import org.apache.synapse.MessageContext;
 import org.apache.synapse.SynapseException;
+import org.apache.synapse.config.SynapsePropertiesLoader;
 import org.apache.synapse.util.logging.LoggingUtils;
 import org.apache.synapse.SynapseConstants;
 import org.apache.synapse.core.SynapseEnvironment;
@@ -39,6 +40,9 @@ import org.apache.synapse.stream.StreamTransform;
 
 import java.io.FilterInputStream;
 import java.io.IOException;
+import java.nio.file.Paths;
+import java.nio.file.Path;
+import java.nio.file.Files;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -115,6 +119,12 @@ public class StreamPipeline implements ManagedLifecycle {
     private boolean wasDeferred;
 
     /**
+     * Root that materialised artifacts are written beneath, from synapse.properties, or {@code null}
+     * when none is configured — in which case materialisation is not permitted.
+     */
+    private String workspaceRoot;
+
+    /**
      * Per-stage checkpoint cadence, in the operator's own checkpoint unit; {@code null} means "use
      * the operator's default". Set from the {@code maxReprocessed} stage attribute.
      */
@@ -134,6 +144,8 @@ public class StreamPipeline implements ManagedLifecycle {
     @Override
     public void init(SynapseEnvironment se) {
         this.environment = se;
+        this.workspaceRoot = SynapsePropertiesLoader.getPropertyValue(
+                SynapseConstants.STREAM_WORKSPACE_ROOT, null);
         auditInfo("Initializing Stream Pipeline: " + name);
 
         // A connector's operators do not exist at parse time, so a pipeline holding one is completed
@@ -291,10 +303,18 @@ public class StreamPipeline implements ManagedLifecycle {
 
         for (int i = 0; i < operators.size(); i++) {
             StreamOperator op = operators.get(i);
-            if (op.materialises() || op.checkpointed()) {
+            if (op.checkpointed()) {
                 throw new StreamException("operator " + i + " ('" + safeName(op) + "') of pipeline '"
-                        + name + "' declares materialises() or checkpointed(), which requires a"
-                        + " workspace; workspace and checkpoint support are not implemented yet");
+                        + name + "' declares checkpointed(), but checkpoint storage is not implemented"
+                        + " yet. Materialisation is: an operator may declare materialises() on its own,"
+                        + " which gives it a workspace directory and makes its stage a segment boundary,"
+                        + " at the cost of re-running the whole segment after a failure");
+            }
+            if (op.materialises() && workspaceRoot == null) {
+                throw new StreamException("operator " + i + " ('" + safeName(op) + "') of pipeline '"
+                        + name + "' materialises but no workspace is configured, so it has nowhere to"
+                        + " write. Set '" + SynapseConstants.STREAM_WORKSPACE_ROOT + "' in"
+                        + " synapse.properties");
             }
         }
     }
@@ -475,6 +495,8 @@ public class StreamPipeline implements ManagedLifecycle {
                     + "): checkpointing is off and any materialised output is scratch");
         }
 
+        Path runDir = prepareWorkspace(runId.value());
+
         List<StageStream> stages = new ArrayList<>();
         StreamException primary = null;
 
@@ -500,7 +522,7 @@ public class StreamPipeline implements ManagedLifecycle {
             for (int i = 0; i < resolved.size(); i++) {
                 OperatorEntry.Resolution resolution = resolved.get(i);
                 StreamOperator op = resolution.operator();
-                DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, op);
+                DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, op, runDir);
 
                 if (op instanceof StreamSink s) {
                     sink = s;
@@ -540,6 +562,21 @@ public class StreamPipeline implements ManagedLifecycle {
                     if (bound) {
                         resolution.release(msg);
                     }
+                }
+
+                // The operator may have short-circuited to an artifact a previous run left behind, in
+                // which case everything built above it will never be read. Release it now rather than
+                // holding a remote connection, unused, for the length of the run. Costs nothing to have
+                // built, because open() and wrap() perform no I/O.
+                if (ctx.hasResumedFromArtifact() && !stages.isEmpty()) {
+                    for (int s = stages.size() - 1; s >= 0; s--) {
+                        resources.closeNow(stages.get(s));
+                    }
+                    log.info("stream pipeline '" + name + "' resumed at stage '" + op.name()
+                            + "' from an existing artifact; released " + stages.size()
+                            + " orphaned upstream stage(s)");
+                    stages.clear();
+                    below = null;
                 }
 
                 below = new StageStream(current, op.name(), below);
@@ -626,10 +663,40 @@ public class StreamPipeline implements ManagedLifecycle {
     }
 
     private DefaultStreamContext contextFor(MessageContext msg, JobContext job,
-                                            ResourceScope resources, StreamOperator op) {
+                                            ResourceScope resources, StreamOperator op, Path runDir) {
         boolean mayUseWorkspace = op.materialises() || op.checkpointed();
+        Path stageDir = (mayUseWorkspace && runDir != null) ? runDir.resolve(op.name()) : null;
         return new DefaultStreamContext(msg, job, resources, op.name(), mayUseWorkspace,
-                op.checkpointed(), null, null);
+                op.checkpointed(), stageDir, null);
+    }
+
+    /**
+     * Creates this run's directory, and the stage directory of every operator that will need one.
+     *
+     * <p>Created up front rather than on first use, so a permissions mistake or an absent mount fails
+     * where someone is looking instead of part-way through a transfer. A stage owns a <b>directory</b>,
+     * not a file: a routing sink writing three outputs needs three artifacts, and a layout assuming
+     * "stage N, artifact N" would have to be migrated to allow it.
+     *
+     * @return the run's directory, or {@code null} if nothing in this pipeline needs one
+     */
+    private Path prepareWorkspace(String runId) throws StreamException {
+        if (workspaceRoot == null || !hasDurableState()) {
+            return null;
+        }
+        Path runDir = Paths.get(workspaceRoot, runId);
+        try {
+            Files.createDirectories(runDir);
+            for (StreamOperator op : operators) {
+                if (op.materialises() || op.checkpointed()) {
+                    Files.createDirectories(runDir.resolve(op.name()));
+                }
+            }
+        } catch (IOException e) {
+            throw new StreamException("stream pipeline '" + name + "' could not prepare its workspace"
+                    + " under '" + runDir + "'", e, true);
+        }
+        return runDir;
     }
 
     private String sinkName() {
@@ -693,6 +760,16 @@ public class StreamPipeline implements ManagedLifecycle {
      * @param maxReprocessed the deployer's bound in the operator's checkpoint unit, or {@code null}
      *                       to take the operator's default
      */
+    /**
+     * Where materialised artifacts are written beneath.
+     *
+     * <p>Normally set by {@link #init} from {@code synapse.properties}. Exposed so a programmatically
+     * assembled pipeline — a test, chiefly — can give itself one without a properties file.
+     */
+    public void setWorkspaceRoot(String root) {
+        this.workspaceRoot = root;
+    }
+
     public void markValidated() {
         this.validated = true;
     }
