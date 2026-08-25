@@ -24,6 +24,8 @@ import org.apache.synapse.config.xml.inbound.InboundEndpointSerializer;
 import org.apache.synapse.config.xml.rest.APISerializer;
 import org.apache.synapse.deployers.SynapseArtifactDeploymentStore;
 import org.apache.synapse.config.SynapseConfiguration;
+import org.apache.synapse.config.xml.stream.StreamPipelineSerializer;
+import org.apache.synapse.stream.pipeline.StreamPipeline;
 import org.apache.synapse.config.Entry;
 import org.apache.synapse.config.xml.eventing.EventSourceSerializer;
 import org.apache.synapse.config.xml.endpoints.EndpointSerializer;
@@ -117,6 +119,9 @@ public class MultiXMLConfigurationSerializer {
                                        definitions);
             serializeAPIs(synapseConfig.getAPIs(), synapseConfig, definitions);
             serializeInboundEndpoints(synapseConfig.getInboundEndpoints(), synapseConfig, definitions);
+            // A pipeline lives in its own map, so it is not reached by the localRegistry walk that
+            // finds sequences. It needs an explicit call or it silently never serializes.
+            serializeStreamPipelines(synapseConfig.getStreamPipelines(), synapseConfig, definitions);
             serializeImports(synapseConfig.getSynapseImports().values(), synapseConfig, definitions);
             serializeComments(synapseConfig.getCommentedTextList(), definitions);
             serializeSynapseXML(definitions);
@@ -692,6 +697,27 @@ public class MultiXMLConfigurationSerializer {
     }
 
 
+    public OMElement serializeStreamPipeline(StreamPipeline pipeline,
+                                            SynapseConfiguration synapseConfig, OMElement parent)
+            throws Exception {
+        File streamPipelinesDir = createDirectory(currentDirectory,
+                MultiXMLConfigurationBuilder.STREAM_PIPELINES_DIR);
+        OMElement pipelineElem = StreamPipelineSerializer.serializeStreamPipeline(null, pipeline);
+
+        String fileName = pipeline.getFileName();
+        if (fileName != null) {
+            if (currentDirectory == rootDirectory) {
+                handleDeployment(streamPipelinesDir, fileName, pipeline.getName(),
+                        synapseConfig.getArtifactDeploymentStore());
+            }
+            File pipelineFile = new File(streamPipelinesDir, fileName);
+            writeToFile(pipelineElem, pipelineFile);
+        } else if (parent != null) {
+            parent.addChild(pipelineElem);
+        }
+        return pipelineElem;
+    }
+
     public OMElement serializeInboundEndpoint(InboundEndpoint inboundEndpoint, SynapseConfiguration synapseConfig,
                                   OMElement parent) throws Exception {
         File inboundEndpointDir = createDirectory(currentDirectory, MultiXMLConfigurationBuilder.INBOUND_ENDPOINT_DIR);
@@ -808,6 +834,14 @@ public class MultiXMLConfigurationSerializer {
         }
     }
 
+    private void serializeStreamPipelines(Collection<StreamPipeline> pipelines,
+                                          SynapseConfiguration synapseConfig,
+                                          OMElement parent) throws Exception {
+        for (StreamPipeline pipeline : pipelines) {
+            serializeStreamPipeline(pipeline, synapseConfig, parent);
+        }
+    }
+
     private void serializeMessageStores(Collection<MessageStore> messageStores,
                                         SynapseConfiguration synapseConfiguration,
                                          OMElement parent) throws Exception{
@@ -886,6 +920,7 @@ public class MultiXMLConfigurationSerializer {
         createDirectory(tempDirectory, MultiXMLConfigurationBuilder.MESSAGE_PROCESSOR_DIR);
         createDirectory(tempDirectory, MultiXMLConfigurationBuilder.REST_API_DIR);
         createDirectory(tempDirectory, MultiXMLConfigurationBuilder.INBOUND_ENDPOINT_DIR);
+        createDirectory(tempDirectory, MultiXMLConfigurationBuilder.STREAM_PIPELINES_DIR);
         createDirectory(tempDirectory, MultiXMLConfigurationBuilder.SYNAPSE_IMPORTS_DIR);
 
         return tempDirectory;
@@ -1000,6 +1035,14 @@ public class MultiXMLConfigurationSerializer {
             if (api.getFileName() != null) {
                 handleDeployment(new File(rootDirectory, MultiXMLConfigurationBuilder.
                         REST_API_DIR), api.getFileName(), api.getName(), deploymentStore);
+            }
+        }
+
+        for (StreamPipeline pipeline : synapseConfig.getStreamPipelines()) {
+            if (pipeline.getFileName() != null) {
+                handleDeployment(new File(rootDirectory, MultiXMLConfigurationBuilder.
+                        STREAM_PIPELINES_DIR), pipeline.getFileName(), pipeline.getName(),
+                        deploymentStore);
             }
         }
 

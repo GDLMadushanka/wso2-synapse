@@ -1,0 +1,4 @@
+org.apache.synapse.config.xml.stream.ClasspathTestOperatorFactory
+org.apache.synapse.config.xml.stream.ClasspathTestSourceFactory
+org.apache.synapse.config.xml.stream.DelegatingTransformFactory
+org.apache.synapse.config.xml.stream.NotRepeatableSinkFactory

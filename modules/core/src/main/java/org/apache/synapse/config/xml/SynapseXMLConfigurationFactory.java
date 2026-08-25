@@ -27,6 +27,8 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.Mediator;
 import org.apache.synapse.Startup;
 import org.apache.synapse.SynapseConstants;
+import org.apache.synapse.config.xml.stream.StreamPipelineFactory;
+import org.apache.synapse.stream.pipeline.StreamPipeline;
 import org.apache.synapse.SynapseException;
 import org.apache.synapse.commons.executors.PriorityExecutor;
 import org.apache.synapse.commons.executors.config.PriorityExecutorFactory;
@@ -113,7 +115,14 @@ public class SynapseXMLConfigurationFactory implements ConfigurationFactory {
                     defineAPI(config, elt, properties);
                 } else if (XMLConfigConstants.DESCRIPTION_ELT.equals(elt.getQName())) {
                     config.setDescription(elt.getText());
-                } else if (XMLConfigConstants.INBOUND_ENDPOINT_ELT.equals(elt.getQName())) {
+                } else if (XMLConfigConstants.STREAM_PIPELINE_ELT.equals(elt.getQName())) {
+                String key = elt.getAttributeValue(new QName(XMLConfigConstants.NULL_NAMESPACE, "key"));
+                if (key != null) {
+                    handleException("Referred stream pipelines are not allowed at the top level");
+                } else {
+                    defineStreamPipeline(config, elt, properties);
+                }
+            } else if (XMLConfigConstants.INBOUND_ENDPOINT_ELT.equals(elt.getQName())) {
                     defineInboundEndpoint(config, elt, properties);
                 } else {
                     handleException("Invalid configuration element at the top level, one of \'sequence\', " +
@@ -453,6 +462,20 @@ public class SynapseXMLConfigurationFactory implements ConfigurationFactory {
             String msg = "Error while re-ordering apis";
             handleConfigurationError(SynapseConstants.FAIL_SAFE_MODE_API, msg, e);
         }
+    }
+
+    public static StreamPipeline defineStreamPipeline(SynapseConfiguration config, OMElement elem,
+                                                     Properties properties) {
+        StreamPipeline pipeline = null;
+        try {
+            pipeline = StreamPipelineFactory.createStreamPipeline(elem, properties);
+            config.addStreamPipeline(pipeline.getName(), pipeline);
+            log.info("Successfully created Stream Pipeline: " + pipeline.getName());
+        } catch (Exception e) {
+            String msg = "Stream pipeline configuration cannot be built";
+            handleConfigurationError(SynapseConstants.FAIL_SAFE_MODE_STREAM_PIPELINES, msg, e);
+        }
+        return pipeline;
     }
 
     public static InboundEndpoint defineInboundEndpoint(SynapseConfiguration config, OMElement elem, Properties properties) {

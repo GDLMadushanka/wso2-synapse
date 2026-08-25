@@ -59,6 +59,7 @@ import org.apache.synapse.endpoints.Template;
 import org.apache.synapse.endpoints.dispatch.SALSessions;
 import org.apache.synapse.eventing.SynapseEventSource;
 import org.apache.synapse.inbound.InboundEndpoint;
+import org.apache.synapse.stream.pipeline.StreamPipeline;
 import org.apache.synapse.inbound.InboundEndpointConstants;
 import org.apache.synapse.libraries.imports.SynapseImport;
 import org.apache.synapse.libraries.model.Library;
@@ -209,6 +210,17 @@ public class SynapseConfiguration implements ManagedLifecycle, SynapseArtifact {
     private Map<String, String> swaggerTable = Collections.synchronizedMap(new LinkedHashMap<String, String>());
 
     private Map<String, InboundEndpoint> inboundEndpointMap = new ConcurrentHashMap<String, InboundEndpoint>();
+
+    /**
+     * Deployed {@code <streamPipeline>} artifacts, by name.
+     * <p>
+     * A pipeline is not a {@code Mediator}, so unlike a sequence it does not live in
+     * {@code localRegistry} — it gets its own map, exactly as an inbound endpoint does. That also
+     * means it inherits <b>no</b> lifecycle: see the explicit loops in {@link #init(SynapseEnvironment)}
+     * and {@link #destroy(boolean)}, without which a pipeline would register perfectly and never be
+     * initialised.
+     */
+    private Map<String, StreamPipeline> streamPipelineMap = new ConcurrentHashMap<String, StreamPipeline>();
 
     /**
      * Contains APIs, mapped against inbound endpoint names to which they are bound to, as specified.
@@ -416,6 +428,33 @@ public class SynapseConfiguration implements ManagedLifecycle, SynapseArtifact {
 	public InboundEndpoint getInboundEndpoint(String name) {
 		return inboundEndpointMap.get(name);
 	}
+
+
+    public synchronized void addStreamPipeline(String name, StreamPipeline pipeline) {
+        if (streamPipelineMap.containsKey(name)) {
+            handleException("Duplicate stream pipeline definition for name : " + name);
+        }
+        streamPipelineMap.put(name, pipeline);
+    }
+
+    public StreamPipeline getStreamPipeline(String name) {
+        return streamPipelineMap.get(name);
+    }
+
+    public Collection<StreamPipeline> getStreamPipelines() {
+        return Collections.unmodifiableCollection(streamPipelineMap.values());
+    }
+
+    public synchronized void updateStreamPipeline(String name, StreamPipeline pipeline) {
+        if (!streamPipelineMap.containsKey(name)) {
+            handleException("No stream pipeline exists by the name : " + name);
+        }
+        streamPipelineMap.put(name, pipeline);
+    }
+
+    public synchronized StreamPipeline removeStreamPipeline(String name) {
+        return streamPipelineMap.remove(name);
+    }
 
 	public Collection<InboundEndpoint> getInboundEndpoints() {
 		return Collections.unmodifiableCollection(inboundEndpointMap.values());
@@ -1661,6 +1700,16 @@ public class SynapseConfiguration implements ManagedLifecycle, SynapseArtifact {
             }
         }
 
+        // destroy the stream pipelines
+        for (StreamPipeline pipeline : streamPipelineMap.values()) {
+            try {
+                pipeline.destroy();
+            } catch (Exception e) {
+                log.error("Error in destroying Stream Pipeline [ " + pipeline.getName() + "] "
+                        + e.getMessage());
+            }
+        }
+
         // destroy the Message Stores
         for (MessageStore ms : messageStores.values()) {
             if (ms instanceof AbstractMessageProcessor) {
@@ -1811,6 +1860,17 @@ public class SynapseConfiguration implements ManagedLifecycle, SynapseArtifact {
 				log.error(" Error in initializing Message Processor [ "
 						+ messageProcessor.getName() + "] " + e.getMessage());
 			}
+        }
+
+        // initialize stream pipelines. A pipeline lives in its own map rather than in
+        // localRegistry, so nothing initialises it unless this loop does.
+        for (StreamPipeline pipeline : streamPipelineMap.values()) {
+            try {
+                pipeline.init(se);
+            } catch (Exception e) {
+                log.error(" Error in initializing Stream Pipeline [ "
+                        + pipeline.getName() + "] " + e.getMessage());
+            }
         }
 
         for (API api : apiTable.values()) {

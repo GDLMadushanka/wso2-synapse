@@ -166,12 +166,7 @@ public class InvokeMediator extends AbstractMediator implements
 
 		// executing key reference if found defined at configuration.
 		if (executePreFetchingSequence && key != null) {
-			String defaultConfiguration = key.evaluateValue(synCtx);
-			Mediator m = synCtx.getDefaultConfiguration(defaultConfiguration);
-			if (m instanceof InvokeMediator) {
-				InvokeMediator invokeMediator = (InvokeMediator) m;
-				invokeMediator.setLocalEntryKey(defaultConfiguration);
-			}
+			Mediator m = resolveKeyReference(synCtx);
 			if (m == null) {
 				handleException("Sequence named " + key + " cannot be found", synCtx);
 
@@ -367,6 +362,67 @@ public class InvokeMediator extends AbstractMediator implements
 	 * @param synCtx
 	 * @param templateQualifiedName
 	 */
+	/**
+	 * Bind this invocation's parameters onto the message, without mediating anything.
+	 *
+	 * <p>Exists for {@code <streamPipeline>}. A pipeline reaches a connector operation the ordinary way
+	 * — this mediator, aimed at the connector's template — but it does not <i>mediate</i> it: it needs
+	 * the operator instance out of the template body and the operation's parameters on the message, then
+	 * it drives the operator itself. That is what lets a connector expose a stream operator with no
+	 * change to how connectors are built.
+	 *
+	 * <p>Callers must pair this with {@link TemplateMediator#popFuncContextFrom}, and must treat the
+	 * binding as valid only for the duration of the call they wrap: one template instance is shared by
+	 * every pipeline and every concurrent run that uses the operation.
+	 *
+	 * @param synCtx   the message to bind against
+	 * @param template the template this invocation targets
+	 */
+	public void bindParameters(MessageContext synCtx, TemplateMediator template) {
+		executeKeyReference(synCtx);
+		populateParameters(synCtx, template.getName());
+		template.pushFuncContextTo(synCtx);
+	}
+
+	/**
+	 * Run the local entry named by {@code configKey}, as {@link #mediate} does before invoking a
+	 * template.
+	 *
+	 * <p>Unlike the mediation path this records no continuation state. That bookkeeping exists so a
+	 * suspended flow can resume at a mediator position, and a pipeline operator occupies no position in
+	 * a mediator flow — pushing one would leave a frame nothing ever pops.
+	 *
+	 * @param synCtx the message to run the reference against
+	 */
+	private void executeKeyReference(MessageContext synCtx) {
+		if (key == null) {
+			return;
+		}
+		Mediator configuration = resolveKeyReference(synCtx);
+		if (configuration != null) {
+			configuration.mediate(synCtx);
+		}
+	}
+
+	/**
+	 * Resolve the local entry named by {@code configKey} and mark it with its own key.
+	 *
+	 * <p>Shared by {@link #mediate} and {@link #bindParameters} so the two paths cannot disagree about
+	 * what a {@code configKey} resolves to. What they do with the result differs — a mediation records
+	 * continuation state around it, a pipeline binding must not — so only the resolution is common.
+	 *
+	 * @param synCtx the message to resolve against
+	 * @return the configuration to mediate, or {@code null} if it could not be found
+	 */
+	private Mediator resolveKeyReference(MessageContext synCtx) {
+		String configName = key.evaluateValue(synCtx);
+		Mediator configuration = synCtx.getDefaultConfiguration(configName);
+		if (configuration instanceof InvokeMediator) {
+			((InvokeMediator) configuration).setLocalEntryKey(configName);
+		}
+		return configuration;
+	}
+
 	private void populateParameters(MessageContext synCtx, String templateQualifiedName) {
 
 		EIPUtils.createSynapseEIPTemplateProperty(synCtx, templateQualifiedName, SynapseConstants.INVOKE_MEDIATOR_ID, id);

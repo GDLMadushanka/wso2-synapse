@@ -170,7 +170,12 @@ public class TemplateMediator extends AbstractListMediator {
      * parameters into Synapse Function Stack.
      * @param synCtx  Synapse Message context
      */
-    private void pushFuncContextTo(MessageContext synCtx) {
+    /**
+     * Widened from private so a {@code <streamPipeline>} can bind a connector operation's parameters
+     * without mediating the template — see {@code InvokeMediator.bindParameters}. Its counterpart
+     * {@link #popFuncContextFrom} was already public, so the pair is now symmetric.
+     */
+    public void pushFuncContextTo(MessageContext synCtx) {
         TemplateContext funcContext = new TemplateContext(eipPatternName, templateParams);
         if (localEntryKey != null) {
             funcContext.setLocalEntryKey(localEntryKey);

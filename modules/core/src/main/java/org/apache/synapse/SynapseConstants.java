@@ -196,6 +196,9 @@ public final class SynapseConstants {
         /** service type param value for the proxy services */
         public static final String PROXY_SERVICE_TYPE = "proxy";
 
+        /** Artifact type used in formatted log lines: {@code {streamPipeline:name} …}. */
+        public static final String STREAM_PIPELINE_TYPE = "streamPipeline";
+
     //- Synapse Message Context Properties -
         /** The Synapse MC property keep the response state */
         public static final String RESPONSE_STATE = "__SYNAPSE_RESPONSE_STATE__";
@@ -540,6 +543,7 @@ public final class SynapseConstants {
     public static final String FAIL_SAFE_MODE_MESSAGE_STORES = "messagestores";
     public static final String FAIL_SAFE_MODE_API = "api";
     public static final String FAIL_SAFE_MODE_INBOUND_ENDPOINT = "inboundendpoint";
+    public static final String FAIL_SAFE_MODE_STREAM_PIPELINES = "streampipelines";
     public static final String FAIL_SAFE_MODE_IMPORTS = "import";
     public static final String FAIL_SAFE_MODE_TASKS = "task";
     public static final String FAIL_SAFE_MODE_REGISTRY = "registry";

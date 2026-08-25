@@ -27,6 +27,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.Mediator;
 import org.apache.synapse.Startup;
 import org.apache.synapse.SynapseConstants;
+import org.apache.synapse.stream.pipeline.StreamPipeline;
 import org.apache.synapse.endpoints.Template;
 import org.apache.synapse.inbound.InboundEndpoint;
 import org.apache.synapse.libraries.imports.SynapseImport;
@@ -91,6 +92,7 @@ public class MultiXMLConfigurationBuilder {
     public static final String MESSAGE_PROCESSOR_DIR    = "message-processors";
     public static final String REST_API_DIR             = "api";
     public static final String INBOUND_ENDPOINT_DIR     = "inbound-endpoints";
+    public static final String STREAM_PIPELINES_DIR      = "stream-pipelines";
     public static final String SYNAPSE_IMPORTS_DIR   = "imports";
 
     public static final String REGISTRY_FILE       = "registry.xml";
@@ -152,6 +154,7 @@ public class MultiXMLConfigurationBuilder {
         createMessageProcessors(synapseConfig, root, properties);
         createAPIs(synapseConfig, root, properties);
         createInboundEndpoint(synapseConfig, root, properties);
+        createStreamPipelines(synapseConfig, root, properties);
         return synapseConfig;
     }
 
@@ -613,6 +616,34 @@ public class MultiXMLConfigurationBuilder {
         }
     }
 
+
+    private static void createStreamPipelines(SynapseConfiguration synapseConfig,
+                                             String rootDirPath, Properties properties) {
+        File streamPipelinesDir = new File(rootDirPath, STREAM_PIPELINES_DIR);
+        if (streamPipelinesDir.exists()) {
+            if (log.isDebugEnabled()) {
+                log.debug("Loading stream pipelines from :" + streamPipelinesDir.getPath());
+            }
+            Iterator pipelines = FileUtils.iterateFiles(streamPipelinesDir, extensions, false);
+            while (pipelines.hasNext()) {
+                File file = (File) pipelines.next();
+                try {
+                    OMElement document = getOMElement(file);
+                    StreamPipeline pipeline = SynapseXMLConfigurationFactory
+                            .defineStreamPipeline(synapseConfig, document, properties);
+                    if (pipeline != null) {
+                        pipeline.setFileName(file.getName());
+                        synapseConfig.getArtifactDeploymentStore()
+                                .addArtifact(file.getAbsolutePath(), pipeline.getName());
+                    }
+                } catch (Exception e) {
+                    String msg = "Stream pipeline configuration cannot be built from : "
+                            + file.getName();
+                    handleConfigurationError(SynapseConstants.FAIL_SAFE_MODE_STREAM_PIPELINES, msg, e);
+                }
+            }
+        }
+    }
 
     private static void createInboundEndpoint(SynapseConfiguration synapseConfig,
                                               String rootDirPath, Properties properties) {

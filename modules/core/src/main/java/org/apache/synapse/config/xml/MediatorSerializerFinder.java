@@ -28,6 +28,7 @@ import org.apache.synapse.config.xml.eventing.EventPublisherMediatorSerializer;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import org.apache.synapse.config.xml.stream.StreamPipelineMediatorSerializer;
 
 public class MediatorSerializerFinder {
 
@@ -80,7 +81,8 @@ public class MediatorSerializerFinder {
             NTLMMediatorSerializer.class,
             VariableMediatorSerializer.class,
             ScatterGatherMediatorSerializer.class,
-            ThrowErrorMediatorSerializer.class
+            ThrowErrorMediatorSerializer.class,
+            StreamPipelineMediatorSerializer.class
     };
 
     private final static MediatorSerializerFinder instance = new MediatorSerializerFinder();
