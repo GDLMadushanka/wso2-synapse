@@ -18,13 +18,22 @@
 
 package org.apache.synapse.stream.pipeline;
 
+import org.apache.synapse.stream.Checkpoint;
+import org.apache.synapse.stream.CheckpointStore;
+import org.apache.synapse.stream.CheckpointStores;
 import org.apache.synapse.stream.JobContext;
+import org.apache.synapse.stream.JobRecord;
+import org.apache.synapse.stream.JobRun;
+import org.apache.synapse.stream.JobStore;
+import org.apache.synapse.stream.JobStores;
 import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamOrigin;
 import org.apache.synapse.stream.StreamSeed;
 import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -215,7 +224,295 @@ public class StreamPipelineTest {
             p.validate();
             fail("expected a checkpointed operator to be rejected");
         } catch (StreamException e) {
-            assertTrue(e.getMessage(), e.getMessage().contains("checkpoint storage is not implemented"));
+            assertTrue(e.getMessage(), e.getMessage().contains("no checkpoint store is registered"));
+        }
+    }
+
+    /**
+     * A failure is attributed to the <b>configured</b> stage name, not the operator's own.
+     *
+     * <p>Those coincide for an SPI operator and diverge for a connector operation, whose {@code name()}
+     * is a class constant shared by every stage using it. The divergence mattered: the per-stage row
+     * went in under the configured name and {@code failed_stage} under the class constant, so they
+     * could not be joined and the fault sequence saw a name nobody wrote.
+     *
+     * <p>Asserted by poisoning {@code name()} — if the failure path still consulted it, the recorded
+     * stage would be the class's simple name instead.
+     */
+    @Test
+    public void attributesAFailureToTheConfiguredStageName() throws Exception {
+        StreamPipeline p = pipeline("attribution");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.FailingSinkWithBrokenName("out"), true);
+        p.validate();
+
+        try {
+            p.execute(null, JobContext.NOOP);
+            fail("expected the sink's failure to propagate");
+        } catch (StreamException e) {
+            assertEquals("the configured name, not the operator's class", "out", e.getStage());
+        }
+    }
+
+    // ------------------------------------------------------------------ scratch space
+
+    /**
+     * Scratch exists so an operator gets working files whose cleanup cannot be forgotten, and it is
+     * <b>ungated</b> — the mock here declares no capability flags at all.
+     */
+    @Test
+    public void scratchIsCreatedForTheStageAndRemovedWhenTheRunEnds() throws Exception {
+        Path root = Files.createTempDirectory("mft-scratch-cfg");
+        Mocks.ScratchUsing spiller = new Mocks.ScratchUsing("spill");
+
+        StreamPipeline p = pipeline("scratch-clean");
+        p.setScratchRoot(root.toString());
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(spiller, true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, jobWithId("job-scratch"));
+
+        assertEquals("a configured root gets a parallel tree, keyed by pipeline, run and stage",
+                root.resolve("scratch-clean").resolve("job-scratch").resolve("spill"),
+                spiller.seenScratch);
+        assertFalse("scratch must not outlive the run", Files.exists(spiller.seenScratch));
+    }
+
+    /** And on the failure path, which is the one an operator would forget. */
+    @Test
+    public void scratchIsRemovedWhenTheRunFails() throws Exception {
+        Path root = Files.createTempDirectory("mft-scratch-fail");
+        Mocks.ScratchUsing spiller = new Mocks.ScratchUsing("spill");
+
+        StreamPipeline p = pipeline("scratch-fail");
+        p.setScratchRoot(root.toString());
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(spiller, true);
+        p.addOperator(new Mocks.FailingSinkWithBrokenName("sink"), true);
+        p.validate();
+
+        try {
+            p.execute(null, jobWithId("job-scratch-fail"));
+            fail("expected the sink's failure to propagate");
+        } catch (StreamException expected) {
+            // the cleanup below is the point
+        }
+        assertNotNull(spiller.seenScratch);
+        assertFalse("a failed run must not leave scratch behind either",
+                Files.exists(spiller.seenScratch));
+    }
+
+    /** With no configured root it lands inside the workspace, which is the documented default. */
+    @Test
+    public void scratchDefaultsToInsideTheWorkspace() throws Exception {
+        Path root = Files.createTempDirectory("mft-scratch-default");
+        Mocks.ScratchUsing spiller = new Mocks.ScratchUsing("spill");
+
+        StreamPipeline p = pipeline("scratch-default");
+        p.setWorkspaceRoot(root.toString());
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.CapturingWorkspace("mat"), true);   // so a workspace exists at all
+        p.addOperator(spiller, true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, jobWithId("job-scratch-default"));
+
+        assertEquals(root.resolve("scratch-default").resolve("job-scratch-default")
+                .resolve("spill").resolve(".scratch"), spiller.seenScratch);
+    }
+
+    // ------------------------------------- a position without an artifact, in a non-terminal stage
+
+    /**
+     * The one flag combination that corrupts silently, and the reason this rule exists.
+     *
+     * <p>{@code source -> forEach(checkpointed, no artifact) -> sink}. forEach mediates fifty records
+     * and records the position; the sink holds their bytes but has not published them. The run fails,
+     * the scope aborts, and the sink's partial output is discarded — correctly. But the checkpoint is
+     * a database row that {@code abort()} never touched, so the retry resumes forEach at record 51
+     * while the sink starts from nothing, and the output is silently missing fifty records.
+     *
+     * <p>Checkpointing the sink too does not help: two independent positions in one segment have
+     * nothing to reconcile against, and {@code L <= A} needs an artifact to compare with.
+     */
+    @Test
+    public void refusesACheckpointedStageWithNoArtifactBeforeAnotherStage() {
+        StreamPipeline p = pipeline("position-without-artifact");
+        p.setWorkspaceRoot("/tmp");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.CheckpointOnly("position"), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        try {
+            p.validate();
+            fail("expected a checkpointed non-terminal stage with no artifact to be rejected");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("is not the last stage"));
+            assertTrue(e.getMessage(), e.getMessage().contains("position"));
+        }
+    }
+
+    /**
+     * A checkpointed <b>sink</b> stays legal, because a sink is always terminal.
+     *
+     * <p>This is combination 5, the remote-authoritative shape — a chunked blob upload whose position
+     * is confirmed by the destination. Nothing downstream can be missing anything, so there is no
+     * second position to reconcile with.
+     */
+    @Test
+    public void allowsACheckpointedSinkWithNoArtifact() throws Exception {
+        CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
+            @Override
+            public Checkpoint lastComplete() {
+                return null;
+            }
+
+            @Override
+            public void append(Checkpoint checkpoint) {
+            }
+
+            @Override
+            public void clear() {
+            }
+        });
+        try {
+            StreamPipeline p = pipeline("remote-authoritative");
+            p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+            p.addOperator(new Mocks.Source("src", DATA), true);
+            p.addOperator(new Mocks.CheckpointingSink("upload"), true);
+            p.validate();
+            p.execute(null, jobWithId("job-sink"));
+        } finally {
+            CheckpointStores.register(null);
+        }
+    }
+
+    /** And the mid-chain shape is legal once it materialises, which is what ends the segment. */
+    @Test
+    public void allowsACheckpointedStageBeforeAnotherWhenItMaterialises() throws Exception {
+        CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
+            @Override
+            public Checkpoint lastComplete() {
+                return null;
+            }
+
+            @Override
+            public void append(Checkpoint checkpoint) {
+            }
+
+            @Override
+            public void clear() {
+            }
+        });
+        try {
+            StreamPipeline p = pipeline("segment-boundary");
+            p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+            p.addOperator(new Mocks.Source("src", DATA), true);
+            p.addOperator(new Mocks.Checkpointing("rows"), true);
+            p.addOperator(new Mocks.Sink("sink"), true);
+            p.validate();
+        } finally {
+            CheckpointStores.register(null);
+        }
+    }
+
+    // ------------------------------------------------------------------ operator names
+
+    /**
+     * A name is read to build workspace paths and to key checkpoints, so a broken {@code name()} has
+     * to fail at deployment. It previously did not: a defensive helper substituted the class simple
+     * name, which puts two stages of the same class into one directory.
+     */
+    @Test
+    public void refusesAnOperatorWhoseNameThrows() {
+        StreamPipeline p = pipeline("throwing-name");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        try {
+            // Caught here rather than at validate(): addOperator reads the name to seed the stage
+            // names, so this is the earliest point it can be reported.
+            p.addOperator(new Mocks.ThrowingName(), true);
+            fail("an operator that throws from name() must be refused at deployment");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("threw from name()"));
+            assertTrue(e.getMessage(), e.getMessage().contains(Mocks.ThrowingName.class.getName()));
+        }
+    }
+
+    /**
+     * The template route does not read a name when the stage is added, because the operator is not
+     * reachable yet, so a broken name() gets as far as validate(). Both doors have to be shut.
+     */
+    @Test
+    public void validateAlsoRefusesANameThatThrows() throws Exception {
+        StreamPipeline p = pipeline("throwing-name-late");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+
+        // An operator whose name() breaks only after it was added, which is what a per-run template
+        // resolution can produce.
+        Mocks.BreaksAfterValidation late = new Mocks.BreaksAfterValidation();
+        p.addOperator(late, true);
+        late.breakName = true;
+        try {
+            p.validate();
+            fail("validate() must refuse a name() that throws");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("threw from name()"));
+            assertTrue(e.getMessage(), e.getMessage().contains("operator 1"));
+        }
+    }
+
+    @Test
+    public void refusesAnOperatorWithNoName() {
+        StreamPipeline p = pipeline("nameless");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.NamedAs(null), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        try {
+            p.validate();
+            fail("expected a null name to be refused");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("has no name()"));
+            assertTrue(e.getMessage(), e.getMessage().contains("operator 1"));
+        }
+    }
+
+    @Test
+    public void refusesABlankName() {
+        StreamPipeline p = pipeline("blank-name");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.NamedAs("   "), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        try {
+            p.validate();
+            fail("expected a blank name to be refused");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("has no name()"));
+        }
+    }
+
+    /**
+     * The one place the defensive read survives: a connector-backed stage is resolved from its
+     * template per run, so the instance that fails need not be the instance validated. A throw here
+     * must not replace the diagnosis the caller needs.
+     */
+    @Test
+    public void aNameThatBreaksAfterValidationDoesNotHideTheRealFailure() throws Exception {
+        Mocks.BreaksAfterValidation sink = new Mocks.BreaksAfterValidation();
+        StreamPipeline p = pipeline("late-break");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(sink, true);
+        p.validate();
+
+        sink.breakName = true;
+        try {
+            p.execute(null, JobContext.NOOP);
+            fail("expected the sink's own failure");
+        } catch (StreamException e) {
+            // The sink's IOException, not an exception from the name-reading code.
+            assertTrue(e.getMessage(), e.getMessage().contains("failed"));
+            assertNotNull(e.getStage());
         }
     }
 
@@ -361,6 +658,201 @@ public class StreamPipelineTest {
         }
     }
 
+    // ------------------------------------------------------------------ the abort protocol
+
+    /**
+     * An Error matched none of the catch clauses, so `primary` stayed null and the finally took the
+     * publish branch — renaming a partial artifact into place, which the next attempt reads as a
+     * finished segment. Publishing is now gated on the pull having completed, not on the absence of a
+     * StreamException.
+     */
+    @Test
+    public void anErrorDuringThePullPublishesNothing() throws Exception {
+        Mocks.Committing spill = new Mocks.Committing("spill");
+
+        StreamPipeline p = pipeline("error-path");
+        p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(spill, true);
+        p.addOperator(new Mocks.ErroringTransform("boom"), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        try {
+            p.execute(null, JobContext.NOOP);
+            fail("the Error must propagate");
+        } catch (StackOverflowError expected) {
+            // unwrapped on purpose: converting it would invite a caller to retry an OOM
+        }
+
+        assertFalse("a failed run must publish nothing", spill.committed.get());
+        assertTrue("and must discard what it wrote", spill.aborted.get());
+    }
+
+    /** The ordinary failure path must still abort, and success must still publish. */
+    @Test
+    public void aSuccessfulRunPublishes() throws Exception {
+        Mocks.Committing spill = new Mocks.Committing("spill");
+
+        StreamPipeline p = pipeline("happy-path");
+        p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(spill, true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, JobContext.NOOP);
+
+        assertTrue(spill.committed.get());
+        assertFalse(spill.aborted.get());
+    }
+
+    // ------------------------------------------------------------------ path safety
+
+    /**
+     * The run id becomes a directory name that a scratch run later deletes recursively, and
+     * Paths.get("/root", "pipe", "") collapses to "/root/pipe" — so an empty job id took the whole
+     * pipeline's directory as its own and reclaiming it would delete every other run.
+     */
+    @Test
+    public void refusesAnEmptyJobId() throws Exception {
+        assertRefusedJobId("", "empty");
+    }
+
+    @Test
+    public void refusesAJobIdThatEscapesItsDirectory() throws Exception {
+        assertRefusedJobId("../../tmp/x", "single path segment");
+    }
+
+    @Test
+    public void refusesADotDotJobId() throws Exception {
+        assertRefusedJobId("..", "does not name a directory");
+    }
+
+    @Test
+    public void refusesAJobIdWithSurroundingWhitespace() throws Exception {
+        assertRefusedJobId(" job-1 ", "whitespace");
+    }
+
+    @Test
+    public void refusesANullJobId() throws Exception {
+        assertRefusedJobId(null, "empty");
+    }
+
+    private void assertRefusedJobId(String jobId, String expectedInMessage) throws Exception {
+        StreamPipeline p = pipeline("path-safety");
+        p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.LazyMaterialising("mat"), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        try {
+            p.execute(null, jobWithId(jobId));
+            fail("expected job id '" + jobId + "' to be refused before anything was created");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("job id"));
+            assertTrue(e.getMessage(), e.getMessage().contains(expectedInMessage));
+        }
+    }
+
+    /**
+     * validate() path-checked op.name(), but the workspace is built from the configured stage name.
+     * They differ for a connector operation, whose op.name() is a safe class constant — so a
+     * configured name of "../../escape" passed validation and then resolved outside the run.
+     */
+    @Test
+    public void refusesAStageNameThatEscapesItsDirectory() {
+        StreamPipeline p = pipeline("stage-path-safety");
+        p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.NamedAs("../../escape"), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+
+        try {
+            p.validate();
+            fail("a stage name that escapes its directory must be refused");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("single path segment"));
+        }
+    }
+
+    // ------------------------------------------------------------------ orphan release
+
+    /**
+     * closeNow() matched by identity against what operators registered, but the pipeline passed its own
+     * StageStream decorators — so it released nothing every time, and then logged that it had. The
+     * release is now by watermark: everything registered before the stage that resumed.
+     */
+    @Test
+    public void releasesTheRegisteredUpstreamWhenAStageResumes() throws Exception {
+        Mocks.RegisteringSource src = new Mocks.RegisteringSource("src", DATA);
+
+        StreamPipeline p = pipeline("resumed-release");
+        p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+        p.addOperator(src, true);
+        p.addOperator(new Mocks.ResumesFromArtifact("mat", DATA), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, JobContext.NOOP);
+
+        assertTrue("the orphaned upstream's handle must be released when the stage resumes, not at the"
+                + " end of a run that may last hours", src.closed.get());
+    }
+
+    /**
+     * Discarding the workspace is not enough. A stage declaring checkpointed() without materialises()
+     * has no artifact for L <= A to reconcile against, so its position survived the discard and the
+     * stage resumed at a byte offset into a source it was no longer reading.
+     */
+    @Test
+    public void warnClearsTheCheckpointAndNotJustTheWorkspace() throws Exception {
+        List<String> cleared = new ArrayList<>();
+        CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
+            @Override
+            public Checkpoint lastComplete() {
+                return null;
+            }
+
+            @Override
+            public void append(Checkpoint checkpoint) {
+            }
+
+            @Override
+            public void clear() {
+                cleared.add(stageName);
+            }
+        });
+        JobStores.register(pipelineName -> new JobStore() {
+            @Override
+            public JobRecord start(JobRun run) {
+                // A previous attempt over a different file, under the same job id.
+                return new JobRecord(run.runId(), "FAILED", 1, "file:/in/a.csv", 16L, 1234L);
+            }
+        });
+        try {
+            Path root = Files.createTempDirectory("mft-warn-ckpt");
+            StreamPipeline p = pipeline("warn-clears");
+            p.setWorkspaceRoot(root.toString());
+            p.setSourceProvided(true);
+            p.addOperator(new Mocks.Checkpointing("position"), true);
+            p.addOperator(new Mocks.Sink("sink"), true);
+            p.validate();
+
+            // Same job id, a source whose size and mtime differ from what was recorded.
+            p.execute(null, jobWithId("job-9"),
+                    new StreamSeed(new ByteArrayInputStream(DATA), "file:/in/a.csv", 99L, 5678L,
+                            StreamOrigin.REOPENABLE));
+
+            assertTrue("the stale position must be forgotten, not just the artifact",
+                    cleared.contains("position"));
+        } finally {
+            CheckpointStores.register(null);
+            JobStores.register(null);
+        }
+    }
+
     // ------------------------------------------------------------------ telemetry
 
     @Test
@@ -375,13 +867,18 @@ public class StreamPipelineTest {
 
         p.execute(null, job);
 
-        assertEquals("one report per wrapped stage", 2, job.stages.size());
+        // Three operators, three reports. This previously asserted 2, which encoded the omission:
+        // the sink has no StageStream around it and so was reported nowhere.
+        assertEquals("one report per stage, sink included", 3, job.stages.size());
         assertTrue(job.stages.containsKey("src"));
         assertTrue(job.stages.containsKey("mid"));
+        assertTrue("the sink is a stage", job.stages.containsKey("sink"));
         assertEquals("the head stage consumed nothing from below",
                 0L, (long) job.stagesIn.get("src"));
         assertEquals("the middle stage consumed what the head produced",
                 (long) job.stages.get("src"), (long) job.stagesIn.get("mid"));
+        assertEquals("the sink consumed what the stage below it produced",
+                (long) job.stages.get("mid"), (long) job.stagesIn.get("sink"));
     }
 
     @Test
@@ -722,7 +1219,7 @@ public class StreamPipelineTest {
 
     /** A caller-supplied job id always wins, and is what an async caller polls with. */
     @Test
-    public void aRealJobIdNamesTheRunAndIsAlwaysStable() {
+    public void aRealJobIdNamesTheRunAndIsAlwaysStable() throws Exception {
         StreamPipeline p = pipeline("queued");
         p.addOperator(new Mocks.Source("src", DATA), true);
         p.addOperator(new Mocks.LazyMaterialising("mat"), true);
@@ -735,7 +1232,7 @@ public class StreamPipelineTest {
 
     /** Two pipelines over the same file must not share one workspace. */
     @Test
-    public void contentAddressedRunsAreNamespacedByPipeline() {
+    public void contentAddressedRunsAreNamespacedByPipeline() throws Exception {
         StreamPipeline a = pipeline("alpha");
         a.setSourceProvided(true);
         a.addOperator(new Mocks.LazyMaterialising("mat"), true);
@@ -878,5 +1375,162 @@ public class StreamPipelineTest {
         p.execute(null, JobContext.NOOP);
 
         assertArrayEquals(DATA, sink.bytes());
+    }
+
+    // ------------------------------------------------------------------ workspace layout
+
+    /**
+     * {@code <root>/<pipeline>/<runId>/<stage>/}. The pipeline level is not needed for uniqueness — a
+     * run id is either a job id or a hash that already folds the pipeline name in — it is there so the
+     * workspace can be operated: retention per pipeline, one pipeline's leftovers cleared on their own,
+     * and a directory's owner readable from its path.
+     */
+    @Test
+    public void aStageWritesUnderPipelineThenRunThenStage() throws Exception {
+        Path root = Files.createTempDirectory("mft-layout");
+        Mocks.CapturingWorkspace mat = new Mocks.CapturingWorkspace("mat");
+
+        StreamPipeline p = pipeline("csv-ingest");
+        p.setWorkspaceRoot(root.toString());
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(mat, true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, jobWithId("job-7"));
+
+        assertEquals(root.resolve("csv-ingest").resolve("job-7").resolve("mat"), mat.seen);
+        assertNotNull("a materialising stage is handed an artifact", mat.seenArtifact);
+        assertTrue("created before the operator ran", Files.isDirectory(mat.seen));
+    }
+
+    /**
+     * Two stages resolving to the same name are refused at deployment.
+     *
+     * <p>A connector operation reaches a shared class whose {@code name()} is a constant, so two stages
+     * of one operation carry the same name unless the configured attribute distinguishes them — and a
+     * stage's name keys its workspace directory, its checkpoints and its per-stage job row.
+     *
+     * <p>An earlier version of this test asserted the collision instead: it checked that both stages
+     * saw the <i>same</i> workspace, which is the overwrite its own javadoc said must not happen. The
+     * check that prevents it did not exist, so the test pinned the defect in place.
+     */
+    @Test
+    public void refusesTwoStagesThatResolveToTheSameName() throws Exception {
+        Path root = Files.createTempDirectory("mft-distinct");
+        StreamPipeline p = pipeline("two-stages");
+        p.setWorkspaceRoot(root.toString());
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.CapturingWorkspace("shared-constant"), true, null);
+        p.addOperator(new Mocks.CapturingWorkspace("shared-constant"), true, null);
+        p.addOperator(new Mocks.Sink("sink"), true);
+
+        try {
+            p.validate();
+            fail("two stages sharing a name share a workspace directory and must be refused");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("two stages named 'shared-constant'"));
+            assertTrue(e.getMessage(), e.getMessage().contains("operators 1 and 2"));
+        }
+    }
+
+    /** A configured name is what makes two stages of one operation distinct, and it works. */
+    @Test
+    public void explicitNamesGiveTwoStagesSeparateDirectories() throws Exception {
+        Path root = Files.createTempDirectory("mft-distinct-ok");
+        Mocks.CapturingWorkspace first = new Mocks.CapturingWorkspace("spill-one");
+        Mocks.CapturingWorkspace second = new Mocks.CapturingWorkspace("spill-two");
+
+        StreamPipeline p = pipeline("two-stages-named");
+        p.setWorkspaceRoot(root.toString());
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(first, true, null);
+        p.addOperator(second, true, null);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, jobWithId("job-8"));
+
+        assertNotNull(first.seen);
+        assertNotNull(second.seen);
+        assertFalse("configured names must yield different directories",
+                first.seen.equals(second.seen));
+    }
+
+    // ------------------------------------------------------------------ checkpoint store wiring
+
+    /**
+     * With a store registered, a checkpointed operator deploys and is handed a store scoped to its own
+     * (run, stage). Scoped rather than shared because two stages resume independently, and two runs of
+     * one pipeline must never see each other's positions.
+     */
+    @Test
+    public void aCheckpointedStageIsHandedAStoreForItsOwnRunAndStage() throws Exception {
+        List<String> asked = new ArrayList<>();
+        CheckpointStores.register((pipelineName, runId, stageName) -> {
+            asked.add(pipelineName + "/" + runId + "/" + stageName);
+            return new CheckpointStore() {
+                @Override
+                public Checkpoint lastComplete() {
+                    return null;
+                }
+
+                @Override
+                public void append(Checkpoint checkpoint) {
+                }
+
+                @Override
+                public void clear() {
+                }
+            };
+        });
+        try {
+            StreamPipeline p = pipeline("ckpt-wired");
+            p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+            p.addOperator(new Mocks.Source("src", DATA), true);
+            p.addOperator(new Mocks.Checkpointing("position"), true);
+            p.addOperator(new Mocks.Sink("sink"), true);
+
+            p.validate();
+            p.execute(null, jobWithId("job-9"));
+
+            assertEquals(1, asked.size());
+            assertEquals("ckpt-wired/job-9/position", asked.get(0));
+        } finally {
+            CheckpointStores.register(null);
+        }
+    }
+
+    /** Absent is a legitimate state, and it is refused at deployment rather than at first byte. */
+    @Test
+    public void withoutAProviderCheckpointingIsRefusedAtDeployment() {
+        assertFalse("no provider should be registered by default", CheckpointStores.isAvailable());
+
+        StreamPipeline p = pipeline("no-store");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.Checkpointing("position"), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        try {
+            p.validate();
+            fail("expected a checkpointed operator with no store to be refused");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("no checkpoint store is registered"));
+        }
+    }
+
+    /** The deployer's bound reaches the operator, which is the only way it can honour it. */
+    @Test
+    public void anOperatorSeesTheDeployersBound() throws Exception {
+        Mocks.CapturingWorkspace mat = new Mocks.CapturingWorkspace("mat");
+        StreamPipeline p = pipeline("cadence-visible");
+        p.setWorkspaceRoot(System.getProperty("java.io.tmpdir"));
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(mat, true, 500);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, jobWithId("job-cadence"));
+
+        assertEquals(500, mat.seenMaxReprocessed);
     }
 }

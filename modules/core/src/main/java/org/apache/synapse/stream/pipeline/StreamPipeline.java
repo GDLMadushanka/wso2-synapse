@@ -27,9 +27,17 @@ import org.apache.synapse.SynapseException;
 import org.apache.synapse.config.SynapsePropertiesLoader;
 import org.apache.synapse.util.logging.LoggingUtils;
 import org.apache.synapse.SynapseConstants;
+import org.apache.synapse.rest.RESTConstants;
 import org.apache.synapse.core.SynapseEnvironment;
+import org.apache.synapse.stream.CheckpointStore;
+import org.apache.synapse.stream.CheckpointStores;
 import org.apache.synapse.stream.JobContext;
+import org.apache.synapse.stream.JobRecord;
+import org.apache.synapse.stream.JobRun;
+import org.apache.synapse.stream.JobStore;
+import org.apache.synapse.stream.JobStores;
 import org.apache.synapse.stream.ResourceScope;
+import org.apache.synapse.stream.SourceIdentityPolicy;
 import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamOperator;
 import org.apache.synapse.stream.StreamOrigin;
@@ -40,14 +48,18 @@ import org.apache.synapse.stream.StreamTransform;
 
 import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Paths;
 import java.nio.file.Path;
 import java.nio.file.Files;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 /**
  * A deployable ordered list of {@link StreamOperator}s, and the only class that knows the chain
@@ -104,6 +116,17 @@ public class StreamPipeline implements ManagedLifecycle {
     private final List<Boolean> explicitNames = new ArrayList<>();
 
     /**
+     * The identity of each stage, in chain order.
+     *
+     * <p>Not {@code op.name()}. A connector operation reaches a <b>shared</b> class whose {@code name()}
+     * is a constant, so two stages of the same operation would otherwise report the same name and — far
+     * worse — resolve to the same workspace directory. The configured {@code name} attribute is what
+     * distinguishes them, which is also why validate() insists on one for any operator keeping durable
+     * state.
+     */
+    private final List<String> stageNames = new ArrayList<>();
+
+    /**
      * One entry per configured stage, in chain order. An entry either holds the operator instance
      * outright or knows the connector template to reach it through — see {@link OperatorEntry}.
      */
@@ -125,10 +148,23 @@ public class StreamPipeline implements ManagedLifecycle {
     private String workspaceRoot;
 
     /**
+     * Root for stage scratch space, from synapse.properties, or {@code null} to place it inside the
+     * workspace. Unlike {@link #workspaceRoot} its absence is not an error: scratch is not durable
+     * state, so there is always somewhere to put it.
+     */
+    private String scratchRoot;
+
+    /**
      * Per-stage checkpoint cadence, in the operator's own checkpoint unit; {@code null} means "use
      * the operator's default". Set from the {@code maxReprocessed} stage attribute.
      */
     private final List<Integer> maxReprocessed = new ArrayList<>();
+
+    /**
+     * What to do when a retry finds a different source than the attempt it is resuming. Defaults to
+     * {@link SourceIdentityPolicy#WARN}, which never resumes across a change but never blocks a run.
+     */
+    private SourceIdentityPolicy sourceIdentity = SourceIdentityPolicy.WARN;
 
     private SynapseEnvironment environment;
 
@@ -146,6 +182,8 @@ public class StreamPipeline implements ManagedLifecycle {
         this.environment = se;
         this.workspaceRoot = SynapsePropertiesLoader.getPropertyValue(
                 SynapseConstants.STREAM_WORKSPACE_ROOT, null);
+        this.scratchRoot = SynapsePropertiesLoader.getPropertyValue(
+                SynapseConstants.STREAM_SCRATCH_ROOT, null);
         auditInfo("Initializing Stream Pipeline: " + name);
 
         // A connector's operators do not exist at parse time, so a pipeline holding one is completed
@@ -187,7 +225,7 @@ public class StreamPipeline implements ManagedLifecycle {
                 try {
                     managed.destroy();
                 } catch (Throwable t) {
-                    log.warn("Failed to destroy operator '" + operators.get(i).name()
+                    log.warn("Failed to destroy operator '" + nameForDiagnosis(operators.get(i))
                             + "' of pipeline '" + name + "'; continuing", t);
                 }
             }
@@ -218,7 +256,11 @@ public class StreamPipeline implements ManagedLifecycle {
 
         for (int i = 0; i <= last; i++) {
             StreamOperator op = operators.get(i);
-            String where = "operator " + i + " ('" + safeName(op) + "') of pipeline '" + name + "'";
+            // Probed before anything else, because every message below interpolates it. Once this
+            // loop has passed, name() is known not to throw for any operator in the chain, and the
+            // rest of validate() and stageNameAt() can call it directly.
+            String opName = requireName(i, op);
+            String where = "operator " + i + " ('" + opName + "') of pipeline '" + name + "'";
 
             // Role exclusivity. execute() dispatches on instanceof StreamSource before position,
             // so a multi-role operator mid-chain would silently discard its upstream.
@@ -236,14 +278,24 @@ public class StreamPipeline implements ManagedLifecycle {
                         + " upstream");
             }
 
-            String opName = op.name();
-            if (opName == null || opName.isBlank()) {
-                throw new StreamException(where + " has no name");
-            }
-            if (opName.indexOf('/') >= 0 || opName.indexOf('\\') >= 0 || opName.indexOf('\0') >= 0
-                    || !opName.equals(opName.trim())) {
-                throw new StreamException(where + " has a name that cannot be used as a path"
-                        + " segment: '" + opName + "'");
+            // Absent, blank and throwing were all handled by requireName() above, before this
+            // message's own text could depend on the answer. What is left is path safety — and it is
+            // checked on the CONFIGURED stage name, not on op.name(). Those differ for a connector
+            // operation, whose op.name() is a safe class constant while the configured name is what
+            // reaches runDir.resolve(): checking the wrong one let name="../../escape" through.
+            String stageName = stageNameAt(i, op);
+            requirePathSegment(where + " has a name", stageName);
+
+            // Two stages sharing a name share a workspace directory, a checkpoint key and a
+            // per-stage job row. The second silently overwrites the first's artifact, and the next
+            // attempt "resumes" the first from the second's output.
+            for (int j = 0; j < i; j++) {
+                if (stageName.equals(stageNameAt(j, operators.get(j)))) {
+                    throw new StreamException("stream pipeline '" + name + "' has two stages named '"
+                            + stageName + "' (operators " + j + " and " + i + "). A stage's name keys"
+                            + " its workspace directory and its checkpoints, so names must be"
+                            + " distinct; give one an explicit name attribute");
+                }
             }
 
             if ((op.checkpointed() || op.materialises()) && !Boolean.TRUE.equals(explicitNames.get(i))) {
@@ -251,6 +303,35 @@ public class StreamPipeline implements ManagedLifecycle {
                         + " requires an explicit name: durable state is keyed by name, and a name"
                         + " derived from chain position stops being meaningful as soon as a stage can"
                         + " appear in more than one branch");
+            }
+
+            // A position that survives a failure, in a stage whose output does not, is the one
+            // combination of the flags that corrupts silently.
+            //
+            // Consider source -> forEach(checkpointed, no artifact) -> fileSink. forEach mediates
+            // records 1..50 and records the position; the sink has their bytes but has not published
+            // them. The run fails, the scope aborts, and the sink's partial output is discarded --
+            // correctly. But the checkpoint is a database row that abort() never touched, so the retry
+            // resumes forEach at record 51 while the sink starts from nothing, and the output is
+            // silently missing fifty records.
+            //
+            // Checkpointing the sink as well does not fix it: two independent positions in one segment
+            // have nothing to reconcile against. L <= A compares a recorded length against an
+            // artifact, and there is no artifact. Materialising is what puts the two stages in
+            // DIFFERENT segments, so their positions never have to agree -- the later one re-runs from
+            // a complete artifact instead.
+            //
+            // A terminal stage is exempt because nothing downstream can be missing anything: a sink is
+            // always terminal, which is why the remote-authoritative sink (checkpointed, no artifact)
+            // stays legal.
+            if (op.checkpointed() && !op.materialises() && i != last) {
+                throw new StreamException(where + " declares checkpointed() without materialises() but"
+                        + " is not the last stage. Its position would survive a failure that discarded"
+                        + " the output of whatever consumes it, so the next attempt would skip work"
+                        + " whose result was never published — silently, and with no way to detect it"
+                        + " afterwards. Declare materialises() as well, which ends a segment here and"
+                        + " lets the stages after it resume from a complete artifact, or move the"
+                        + " checkpoint to the last stage");
             }
 
             if (op instanceof StreamSink) {
@@ -279,7 +360,7 @@ public class StreamPipeline implements ManagedLifecycle {
             if (!(terminal instanceof StreamTransform) || !terminal.materialises()) {
                 throw new StreamException("stream pipeline '" + name + "' must end with a StreamSink,"
                         + " or with a StreamTransform that declares materialises(); operator " + last
-                        + " ('" + safeName(terminal) + "') is neither, so this pipeline would pull"
+                        + " ('" + terminal.name() + "') is neither, so this pipeline would pull"
                         + " bytes and discard them with no durable effect anywhere");
             }
         }
@@ -301,17 +382,30 @@ public class StreamPipeline implements ManagedLifecycle {
             }
         }
 
+        // The guard compares this attempt's source identity against the previous attempt's, and that
+        // identity only exists when the caller supplies a StreamSeed. A pipeline that opens its own
+        // source records none, so the comparison can never happen — and STRICT promises to refuse a
+        // changed source. A promise that cannot be kept is refused here rather than left inert.
+        if (sourceIdentity == SourceIdentityPolicy.STRICT && !sourceProvided) {
+            throw new StreamException("stream pipeline '" + name + "' declares"
+                    + " sourceIdentity=\"strict\" but opens its own source, so no source identity is"
+                    + " recorded and nothing can be compared against a later attempt. strict is only"
+                    + " honoured for sourceProvided=\"true\" pipelines, whose caller supplies the"
+                    + " identity along with the stream");
+        }
+
         for (int i = 0; i < operators.size(); i++) {
             StreamOperator op = operators.get(i);
-            if (op.checkpointed()) {
-                throw new StreamException("operator " + i + " ('" + safeName(op) + "') of pipeline '"
-                        + name + "' declares checkpointed(), but checkpoint storage is not implemented"
-                        + " yet. Materialisation is: an operator may declare materialises() on its own,"
-                        + " which gives it a workspace directory and makes its stage a segment boundary,"
-                        + " at the cost of re-running the whole segment after a failure");
+            if (op.checkpointed() && !CheckpointStores.isAvailable()) {
+                throw new StreamException("operator " + i + " ('" + op.name() + "') of pipeline '"
+                        + name + "' declares checkpointed(), but no checkpoint store is registered."
+                        + " Checkpoints live in the MFT datasource, so this needs one configured. An"
+                        + " operator may declare materialises() on its own, which gives it a workspace"
+                        + " directory and makes its stage a segment boundary, at the cost of re-running"
+                        + " the whole segment after a failure");
             }
             if (op.materialises() && workspaceRoot == null) {
-                throw new StreamException("operator " + i + " ('" + safeName(op) + "') of pipeline '"
+                throw new StreamException("operator " + i + " ('" + op.name() + "') of pipeline '"
                         + name + "' materialises but no workspace is configured, so it has nowhere to"
                         + " write. Set '" + SynapseConstants.STREAM_WORKSPACE_ROOT + "' in"
                         + " synapse.properties");
@@ -390,9 +484,16 @@ public class StreamPipeline implements ManagedLifecycle {
      *
      * @return the run id, and whether it is stable enough to resume from
      */
-    RunId resolveRunId(JobContext jobCtx, StreamSeed seed, StreamOrigin origin) {
-        if (!JobContext.NOOP_JOB_ID.equals(jobCtx.jobId())) {
-            return new RunId(jobCtx.jobId(), true);
+    RunId resolveRunId(JobContext jobCtx, StreamSeed seed, StreamOrigin origin)
+            throws StreamException {
+        String callerJobId = jobCtx.jobId();
+        if (!JobContext.NOOP_JOB_ID.equals(callerJobId)) {
+            // The only run id the framework does not mint itself, and it becomes a directory name that
+            // a scratch run later deletes recursively. jobId()'s javadoc asks for a path-safe value;
+            // nothing made it so, and the penalty for an empty one was deleting every run of this
+            // pipeline. Checked before anything is created, so a refusal costs nothing.
+            requirePathSegment("job id", callerJobId);
+            return new RunId(callerJobId, true);
         }
         if (seed != null && origin == StreamOrigin.REOPENABLE) {
             // Content-addressed: same pipeline over the same bytes resumes into the same workspace, and
@@ -416,6 +517,73 @@ public class StreamPipeline implements ManagedLifecycle {
 
     /** A run's workspace name, and whether anything may resume from it. */
     record RunId(String value, boolean stable) {
+    }
+
+    /** What invoked a run: a kind, and the invoking artifact's name when one could be identified. */
+    record Invoker(String type, String name) {
+    }
+
+    /**
+     * Works out what invoked this run, so nobody has to remember to say.
+     *
+     * <p>Synapse already stamps the invoking artifact onto the message context, and this reads the same
+     * three properties, in the same order, as {@code TimeoutHandler} and {@code Axis2FlexibleMEPClient}
+     * do when they answer the same question for a timeout or an outbound call. Ordering is theirs, not
+     * ours: a proxy's own dispatch beats an API's, and an API beats the inbound endpoint that fed it.
+     *
+     * <p>All three are <b>Synapse</b> properties rather than Axis2 ones, so a plain
+     * {@code getProperty} reads them.
+     *
+     * <h2>Why this is derived and not declared</h2>
+     * The first version of this asked the caller, through {@code JobContext.flow()}. Nothing ever set a
+     * {@code JobContext}, so every row recorded the same default and the column was worthless. A value
+     * the framework can see for itself should never be a caller's obligation — see ADR-0030.
+     *
+     * <p>{@link JobContext} may still override, and one caller must: a message processor's context is
+     * synthesised and names none of these artifacts.
+     *
+     * @param msg    the invoking message context, which may be {@code null}
+     * @param jobCtx the caller's context, consulted first
+     * @return the invoker; its type is never {@code null}, its name may be
+     */
+    private Invoker resolveInvoker(MessageContext msg, JobContext jobCtx) {
+        String declaredType = trimToNull(jobCtx.invokerType());
+        if (declaredType != null) {
+            return new Invoker(declaredType, trimToNull(jobCtx.invokerName()));
+        }
+
+        if (msg != null) {
+            String proxy = trimToNull(asString(msg.getProperty(SynapseConstants.PROXY_SERVICE)));
+            if (proxy != null) {
+                return new Invoker("PROXY", proxy);
+            }
+            // Carries "name:vX" for a versioned API, which is that API's real identity and is stored
+            // as such — anything filtering on it later has to match the same string.
+            String api = trimToNull(asString(msg.getProperty(RESTConstants.SYNAPSE_REST_API)));
+            if (api != null) {
+                return new Invoker("API", api);
+            }
+            String inbound = trimToNull(
+                    asString(msg.getProperty(SynapseConstants.INBOUND_ENDPOINT_NAME)));
+            if (inbound != null) {
+                return new Invoker("INBOUND", inbound);
+            }
+        }
+
+        // Reached by a pipeline run from a plain sequence, and by tests, which pass no context at all.
+        return new Invoker("DIRECT", trimToNull(jobCtx.invokerName()));
+    }
+
+    private static String asString(Object value) {
+        return value == null ? null : value.toString();
+    }
+
+    private static String trimToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 
 
@@ -497,8 +665,40 @@ public class StreamPipeline implements ManagedLifecycle {
 
         Path runDir = prepareWorkspace(runId.value());
 
+        // Every run is recorded, whether or not the caller wanted reporting: a partial answer to "what
+        // is running" is worse than none. NOOP when no provider is registered, which is the normal
+        // state for a Synapse with no datasource behind it.
+        JobStore store = JobStores.storeFor(name);
+        Invoker invoker = resolveInvoker(msg, jobCtx);
+        JobRecord prior = store.start(new JobRun(runId.value(), name, invoker.type(), invoker.name(),
+                resumable, runDir == null ? null : runDir.toString(),
+                seed == null ? null : seed.sourceId(),
+                seed == null ? StreamSeed.UNKNOWN : seed.size(),
+                seed == null ? StreamSeed.UNKNOWN : seed.lastModified()));
+
+        runDir = guardSourceIdentity(prior, seed, runId, runDir);
+
+        // From here on the caller's context is wrapped, so an operator reporting progress writes a row
+        // without knowing this happens. Both obligations are met by one call.
+        RecordingJobContext recorder = new RecordingJobContext(jobCtx, store, runId.value());
+        jobCtx = recorder;
+
         List<StageStream> stages = new ArrayList<>();
         StreamException primary = null;
+
+        /**
+         * Whether the pull ran to completion. Publishing is gated on this rather than on
+         * {@code primary == null}, because an Error matches none of the catch clauses below and would
+         * otherwise leave primary null on a run that plainly did not succeed — committing a partial
+         * artifact that the next attempt reads as a finished segment. Any throwable that skips the
+         * assignment aborts, without this class having to enumerate what those are.
+         */
+        boolean pulled = false;
+
+        // The sink is not a StageStream — it consumes rather than producing a stream to decorate — so
+        // its figures have to be gathered here or it gets no per-stage row at all.
+        String sinkStage = null;
+        long sinkElapsedNanos = -1L;
 
         ResourceScope resources = new ResourceScope();
         try {
@@ -522,12 +722,15 @@ public class StreamPipeline implements ManagedLifecycle {
             for (int i = 0; i < resolved.size(); i++) {
                 OperatorEntry.Resolution resolution = resolved.get(i);
                 StreamOperator op = resolution.operator();
-                DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, op, runDir);
+                String stage = stageNameAt(i, op);
+                DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, op, stage, runId.value(),
+                        runDir, maxReprocessed(i));
 
                 if (op instanceof StreamSink s) {
                     sink = s;
                     sinkCtx = ctx;
                     sinkResolution = resolution;
+                    sinkStage = stage;
                     continue;                       // the sink wraps nothing; it reads
                 }
 
@@ -536,26 +739,31 @@ public class StreamPipeline implements ManagedLifecycle {
                 // operator must capture what it needs here: the stream it returns is read later, when
                 // nothing is bound. For an SPI-built operator this is a no-op — its configuration is
                 // already in its own fields.
+                // Everything registered with the scope up to here belongs to a stage upstream of this
+                // one. If this stage turns out to have resumed from an artifact, that is exactly the
+                // set to release — see ResourceScope.closeNowRegisteredBefore.
+                int upstreamMark = resources.registered();
+
                 boolean bound = resolution.bind(msg);
                 try {
                     if (op instanceof StreamSource src) {
                         current = src.open(ctx);
                         if (current == null) {
-                            throw new StreamException("operator '" + op.name() + "' returned a null"
+                            throw new StreamException("operator '" + stage + "' returned a null"
                                     + " stream from open(); emptiness is -1 on first read, not null")
-                                    .withStage(op.name());
+                                    .withStage(stage);
                         }
                     } else {
                         InputStream upstream = current;
                         current = ((StreamTransform) op).wrap(upstream, ctx);
                         if (current == null) {
-                            throw new StreamException("operator '" + op.name() + "' returned a null"
-                                    + " stream from wrap()").withStage(op.name());
+                            throw new StreamException("operator '" + stage + "' returned a null"
+                                    + " stream from wrap()").withStage(stage);
                         }
                         if (current == upstream) {
-                            throw new StreamException("operator '" + op.name() + "' returned its own"
+                            throw new StreamException("operator '" + stage + "' returned its own"
                                     + " upstream from wrap(); a pass-through must still be a distinct"
-                                    + " wrapper or per-stage accounting is wrong").withStage(op.name());
+                                    + " wrapper or per-stage accounting is wrong").withStage(stage);
                         }
                     }
                 } finally {
@@ -569,17 +777,24 @@ public class StreamPipeline implements ManagedLifecycle {
                 // holding a remote connection, unused, for the length of the run. Costs nothing to have
                 // built, because open() and wrap() perform no I/O.
                 if (ctx.hasResumedFromArtifact() && !stages.isEmpty()) {
-                    for (int s = stages.size() - 1; s >= 0; s--) {
-                        resources.closeNow(stages.get(s));
+                    // Recorded before the list is cleared, or a resumed run's per-stage table is
+                    // simply missing rows for the segments it skipped -- sparse, and with nothing
+                    // saying why. The status column already exists for this.
+                    for (StageStream released : stages) {
+                        recorder.recordSkipped(released.stage());
                     }
-                    log.info("stream pipeline '" + name + "' resumed at stage '" + op.name()
-                            + "' from an existing artifact; released " + stages.size()
-                            + " orphaned upstream stage(s)");
+                    // By watermark, not by identity. The stages list holds StageStream decorators the
+                    // pipeline built; the handles worth releasing are what the operators registered,
+                    // which the scope knows and this class does not.
+                    resources.closeNowRegisteredBefore(upstreamMark);
+                    log.info("stream pipeline '" + name + "' resumed at stage '" + stage
+                            + "' from an existing artifact; released " + upstreamMark
+                            + " orphaned upstream resource(s) across " + stages.size() + " stage(s)");
                     stages.clear();
                     below = null;
                 }
 
-                below = new StageStream(current, op.name(), below);
+                below = new StageStream(current, stage, below);
                 current = below;
                 stages.add(below);
             }
@@ -592,9 +807,13 @@ public class StreamPipeline implements ManagedLifecycle {
                 // Held for the whole pull rather than just the call, because everything upstream
                 // executes inside consume().
                 boolean sinkBound = sinkResolution != null && sinkResolution.bind(msg);
+                long sinkStartNanos = System.nanoTime();
                 try {
                     sink.consume(current, sinkCtx);
                 } finally {
+                    // Measured even on failure: a sink that died after twenty minutes is exactly the
+                    // thing someone wants to see afterwards.
+                    sinkElapsedNanos = System.nanoTime() - sinkStartNanos;
                     if (sinkBound) {
                         sinkResolution.release(msg);
                     }
@@ -607,20 +826,30 @@ public class StreamPipeline implements ManagedLifecycle {
                 drain(current, jobCtx);
             }
 
+            pulled = true;
+
         } catch (StageStream.StageIOException e) {
-            primary = new StreamException("stream pipeline '" + name + "' failed", e, true)
-                    .withStage(e.getStage());
+            primary = new StreamException("stream pipeline '" + name + "' failed", e,
+                    retryable(e.getCause())).withStage(e.getStage());
         } catch (IOException e) {
             // Not attributed, so it can only have come from the sink — the one unwrapped position.
-            primary = new StreamException("stream pipeline '" + name + "' failed", e, true)
+            primary = new StreamException("stream pipeline '" + name + "' failed", e, retryable(e))
                     .withStage(sinkName());
         } catch (StreamException e) {
             primary = e.getStage() == null ? e.withStage(sinkName()) : e;
         } catch (RuntimeException e) {
             primary = new StreamException("stream pipeline '" + name + "' failed unexpectedly", e);
+        } catch (Throwable t) {
+            // An Error: OutOfMemory, StackOverflow from a recursive mediation sequence, a
+            // NoClassDefFoundError from a connector missing a transitive dependency. Record the run as
+            // failed, then let it propagate UNWRAPPED — turning an OutOfMemoryError into a
+            // StreamException would invite a caller to retry it. `pulled` is false, so the finally
+            // aborts and nothing is published.
+            recorder.recordFailure(sinkName(), "STREAM_PIPELINE_ERROR", t.toString(), false);
+            throw t;
         } finally {
             try {
-                if (primary == null) {
+                if (pulled && primary == null) {
                     resources.close();
                 } else {
                     // The run failed. Release everything and publish nothing: a committing resource
@@ -638,13 +867,189 @@ public class StreamPipeline implements ManagedLifecycle {
                             + " failed to commit its output", closeFailure, true);
                 }
             }
-            reportStagesQuietly(jobCtx, stages);
+            reportStagesQuietly(jobCtx, stages, sinkStage, sinkElapsedNanos);
+            reclaimScratchWorkspace(runDir, resumable, runId.value());
         }
 
         if (primary != null) {
-            jobCtx.failed(primary.getStage(), "STREAM_PIPELINE_FAILED", primary.getMessage());
+            recorder.recordFailure(primary.getStage(), "STREAM_PIPELINE_FAILED", primary.getMessage(),
+                    primary.isRetryable());
             throw primary;
         }
+        recorder.succeeded();
+    }
+
+    /**
+     * Refuses, resets or ignores a run whose source is not the one the previous attempt read.
+     *
+     * <p>Only reached when a previous attempt recorded an identity, which in practice means a
+     * caller-supplied job id: a content-addressed run folds the source's identity into its own name, so
+     * a changed source already lands in a different workspace and has nothing to collide with.
+     *
+     * @return the workspace to use, which is a fresh one when a stale workspace was discarded
+     * @throws StreamException under {@link SourceIdentityPolicy#STRICT}, or if the discard failed
+     */
+    private Path guardSourceIdentity(JobRecord prior, StreamSeed seed, RunId runId, Path runDir)
+            throws StreamException {
+
+        if (prior == null || seed == null || !prior.hasSourceIdentity()
+                || sourceIdentity == SourceIdentityPolicy.OFF || sameSource(prior, seed)) {
+            return runDir;
+        }
+
+        String detail = "run '" + runId.value() + "' of stream pipeline '" + name + "' previously read "
+                + describeSource(prior.sourceId(), prior.sourceSize(), prior.sourceLastModified())
+                + " but this attempt found "
+                + describeSource(seed.sourceId(), seed.size(), seed.lastModified());
+
+        if (sourceIdentity == SourceIdentityPolicy.STRICT) {
+            throw new StreamException(detail + "; sourceIdentity=\"strict\" refuses to continue", false);
+        }
+
+        // Warning and then resuming anyway would splice two different sources into one artifact and
+        // commit it as complete. The discard is the point of this branch, not a tidy-up after it.
+        log.warn(detail + ": discarding the previous attempt's workspace and starting over, because"
+                + " resuming would join bytes from two different sources into one artifact");
+        discardWorkspace(runDir);
+        clearCheckpoints(runId.value());
+        return prepareWorkspace(runId.value());
+    }
+
+    /**
+     * Forgets every checkpointed stage's position, so the segment restarts from clean.
+     *
+     * <p>Discarding the workspace alone was not enough. A stage declaring {@code checkpointed()} without
+     * {@code materialises()} has no artifact, so {@code L <= A} could not catch a stale position: the
+     * artifact was gone but the recorded byte offset survived, and the stage resumed at an offset into a
+     * source it was no longer reading.
+     *
+     * @throws StreamException if a position could not be cleared — continuing would resume from a
+     *                         position already known to be wrong
+     */
+    private void clearCheckpoints(String runId) throws StreamException {
+        if (!CheckpointStores.isAvailable()) {
+            return;
+        }
+        for (int i = 0; i < operators.size(); i++) {
+            StreamOperator op = operators.get(i);
+            if (!op.checkpointed()) {
+                continue;
+            }
+            String stage = stageNameAt(i, op);
+            try {
+                CheckpointStores.storeFor(name, runId, stage).clear();
+            } catch (IOException | RuntimeException e) {
+                throw new StreamException("stream pipeline '" + name + "' found run '" + runId
+                        + "' reading a different source, but could not clear stage '" + stage
+                        + "''s checkpoint; refusing to resume from a position known to be wrong", e,
+                        true);
+            }
+        }
+    }
+
+    /** Identity is all three fields: a same-sized rewrite at a new mtime is still a different source. */
+    private static boolean sameSource(JobRecord prior, StreamSeed seed) {
+        return Objects.equals(prior.sourceId(), seed.sourceId())
+                && prior.sourceSize() == seed.size()
+                && prior.sourceLastModified() == seed.lastModified();
+    }
+
+    private static String describeSource(String id, long size, long lastModified) {
+        return "'" + id + "' (size=" + (size == StreamSeed.UNKNOWN ? "unknown" : size)
+                + ", lastModified=" + (lastModified == StreamSeed.UNKNOWN ? "unknown" : lastModified)
+                + ")";
+    }
+
+    /**
+     * Deletes a scratch run's workspace once the run has ended.
+     *
+     * <p>A scratch run is one nothing can ever resume — no stable identity to resume <i>into</i>, or a
+     * one-shot origin with no second attempt to resume <i>from</i>. Its artifacts stop being useful the
+     * moment the run ends, so leaving them accumulates data nothing tracks and nothing will ever read.
+     * That is exactly what a 1 GB spill from a completed copy is.
+     *
+     * <p>Runs after the resource scope has been closed or aborted, so nothing here races an open
+     * handle, and after reporting, so a stage's figures are recorded before its directory disappears.
+     *
+     * <h2>Nothing here asks what the pipeline produced</h2>
+     * The workspace never holds output — ADR-0029. It is pipeline-owned space for restart state, and
+     * durable results leave through a sink, to a path the deployer chose. So "was there a sink" is not
+     * a question this needs to ask: a pipeline ending in a materialising transform is doing its work
+     * through side effects, and its artifact is spill exactly like any other stage's.
+     *
+     * <p>The one case left alone is a <b>resumable</b> run, whose artifacts are resume candidates while
+     * it is in flight. Once it has succeeded they are arguably garbage too, but that is retention
+     * policy — an open question, and not one to decide from inside a run.
+     *
+     * <p>Never throws. The bytes have already landed and the run's outcome is settled; failing it now
+     * over a directory that could not be removed would turn a successful transfer into a failed one.
+     */
+    private void reclaimScratchWorkspace(Path runDir, boolean resumable, String runId) {
+        if (runDir == null || resumable) {
+            return;
+        }
+        try {
+            discardWorkspace(runDir);
+            if (log.isDebugEnabled()) {
+                log.debug("stream pipeline '" + name + "' reclaimed the scratch workspace of run '"
+                        + runId + "'; nothing could have resumed from it");
+            }
+        } catch (StreamException | RuntimeException e) {
+            log.warn("stream pipeline '" + name + "' could not reclaim the scratch workspace of run '"
+                    + runId + "' at '" + runDir + "'; the transfer is unaffected but the directory is"
+                    + " left behind and nothing will collect it", e);
+        }
+    }
+
+    /** Removes a run directory, whether stale, scratch, or belonging to a different source. */
+    private void discardWorkspace(Path runDir) throws StreamException {
+        if (runDir == null || !Files.exists(runDir)) {
+            return;
+        }
+        try (Stream<Path> tree = Files.walk(runDir)) {
+            tree.sorted(Comparator.reverseOrder()).forEach(entry -> {
+                try {
+                    Files.delete(entry);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+        } catch (IOException e) {
+            throw new StreamException("could not discard the stale workspace at '" + runDir + "'", e,
+                    true);
+        } catch (UncheckedIOException e) {
+            throw new StreamException("could not discard the stale workspace at '" + runDir + "'",
+                    e.getCause(), true);
+        }
+    }
+
+    /**
+     * Whether another attempt at this failure could plausibly succeed.
+     *
+     * <p>Every {@code IOException} from the chain used to be recorded as retryable, which is wrong in
+     * the direction that hurts: {@code StreamException}'s own javadoc lists a truncated input, a wrong
+     * decryption key and a failed integrity check as <b>not</b> retryable, and warns that a false
+     * {@code true} "produces an infinite retry loop that presents as a hang". A processor re-queueing
+     * off that verdict would retry a permanently corrupt archive forever.
+     *
+     * <p>An operator that knows better says so, by throwing a {@link StreamException} with its own
+     * verdict; that is honoured ahead of anything guessed here. Otherwise the judgement is made on the
+     * exception type, and the listed cases are the ones a second attempt cannot fix.
+     */
+    private static boolean retryable(Throwable failure) {
+        for (Throwable t = failure; t != null; t = t.getCause()) {
+            if (t instanceof StreamException streamException) {
+                return streamException.isRetryable();
+            }
+            // Data that will not become valid by being read again.
+            if (t instanceof java.util.zip.ZipException
+                    || t instanceof java.nio.charset.CharacterCodingException
+                    || t instanceof java.io.CharConversionException
+                    || t instanceof java.io.EOFException) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -663,15 +1068,61 @@ public class StreamPipeline implements ManagedLifecycle {
     }
 
     private DefaultStreamContext contextFor(MessageContext msg, JobContext job,
-                                            ResourceScope resources, StreamOperator op, Path runDir) {
+                                            ResourceScope resources, StreamOperator op, String stage,
+                                            String runId, Path runDir, int maxReprocessed) {
         boolean mayUseWorkspace = op.materialises() || op.checkpointed();
-        Path stageDir = (mayUseWorkspace && runDir != null) ? runDir.resolve(op.name()) : null;
-        return new DefaultStreamContext(msg, job, resources, op.name(), mayUseWorkspace,
-                op.checkpointed(), stageDir, null);
+        Path stageDir = (mayUseWorkspace && runDir != null) ? runDir.resolve(stage) : null;
+
+        // Scoped to (run, stage): two stages resume independently, and two runs of one pipeline must
+        // never see each other's positions.
+        CheckpointStore store = op.checkpointed() && CheckpointStores.isAvailable()
+                ? CheckpointStores.storeFor(name, runId, stage)
+                : null;
+
+        return new DefaultStreamContext(msg, job, resources, stage, mayUseWorkspace,
+                op.checkpointed(), stageDir, store, maxReprocessed, scratchTarget(stage, runId, runDir));
+    }
+
+    /**
+     * Where a stage's scratch directory should go — not created here, and not created at all unless
+     * the stage asks.
+     *
+     * <p>Ungated by the capability flags, unlike the workspace: scratch is not durable state, and a
+     * pure decorator that needs a working file should not have to claim {@code materialises()} to get
+     * one. A configured root gets a parallel tree, which is the point of configuring it — scratch is
+     * node-local, so it belongs on local disk rather than on the cluster mount.
+     *
+     * @return the target directory, or {@code null} to let the context fall back to a JVM temp
+     *         directory because there is nowhere else
+     */
+    private Path scratchTarget(String stage, String runId, Path runDir) {
+        if (scratchRoot != null) {
+            return Paths.get(scratchRoot, name, runId, stage);
+        }
+        if (runDir != null) {
+            return runDir.resolve(stage).resolve(".scratch");
+        }
+        return null;
+    }
+
+    /** This stage's identity — the configured name, falling back to the operator's own. */
+    private String stageNameAt(int index, StreamOperator op) {
+        String configured = index < stageNames.size() ? stageNames.get(index) : null;
+        return (configured == null || configured.isEmpty()) ? op.name() : configured;
     }
 
     /**
      * Creates this run's directory, and the stage directory of every operator that will need one.
+     *
+     * <p>The layout is {@code <root>/<pipeline>/<runId>/<stage>/}. The pipeline level is not needed for
+     * uniqueness — a run id is either a job id or a hash that already folds the pipeline name in — it is
+     * there so the workspace can be operated: retention set per pipeline, one pipeline's leftovers
+     * cleared without touching the rest, and a directory's owner readable from its path rather than by
+     * inspecting it. A flat root is thousands of opaque run ids.
+     *
+     * <p>The cost, accepted: the pipeline name is now part of a durable path, so renaming a pipeline
+     * orphans its in-flight runs. A rename already invalidated content-addressed run ids; this extends
+     * that to job-id runs too.
      *
      * <p>Created up front rather than on first use, so a permissions mistake or an absent mount fails
      * where someone is looking instead of part-way through a transfer. A stage owns a <b>directory</b>,
@@ -684,12 +1135,13 @@ public class StreamPipeline implements ManagedLifecycle {
         if (workspaceRoot == null || !hasDurableState()) {
             return null;
         }
-        Path runDir = Paths.get(workspaceRoot, runId);
+        Path runDir = Paths.get(workspaceRoot, name, runId);
         try {
             Files.createDirectories(runDir);
-            for (StreamOperator op : operators) {
+            for (int i = 0; i < operators.size(); i++) {
+                StreamOperator op = operators.get(i);
                 if (op.materialises() || op.checkpointed()) {
-                    Files.createDirectories(runDir.resolve(op.name()));
+                    Files.createDirectories(runDir.resolve(stageNameAt(i, op)));
                 }
             }
         } catch (IOException e) {
@@ -699,27 +1151,158 @@ public class StreamPipeline implements ManagedLifecycle {
         return runDir;
     }
 
+    /**
+     * The terminal stage's name, for attributing a failure that arrived unattributed.
+     *
+     * <p>Reads the <b>configured</b> stage name, the same value every other durable record uses — the
+     * workspace directory, the checkpoint key and the {@code MFT_JOB_STAGE} row. An earlier version
+     * read {@code op.name()} instead, which for a connector operation is a class constant: a stage
+     * configured as {@code <file.streamWrite name="out"/>} recorded its per-stage row under
+     * {@code out} and its failure under {@code file.streamWrite}, so the two could not be joined and
+     * the fault sequence saw a name the deployer never wrote.
+     *
+     * <p>It also cannot throw. {@code stageNames} is fixed at parse time, so unlike {@code op.name()}
+     * there is no call here to fail while a failure is already being reported.
+     */
     private String sinkName() {
-        return operators.isEmpty() ? name : safeName(operators.get(operators.size() - 1));
+        if (operators.isEmpty()) {
+            return name;
+        }
+        int last = operators.size() - 1;
+        return stageNameAt(last, operators.get(last));
     }
 
-    private static String safeName(StreamOperator op) {
+    /**
+     * An operator's name, or a {@link StreamException} naming it by position.
+     *
+     * <p>Called once per operator at the top of {@link #validate()}, which is what entitles the rest
+     * of this class to call {@code name()} directly. A name that is absent or that throws is a broken
+     * operator, and the only useful time to say so is deployment: the value ends up naming a workspace
+     * directory and keying both the checkpoint store and the per-stage job rows, so substituting
+     * something plausible at run time would put two stages of the same class into one directory —
+     * exactly the collision an explicit name exists to prevent.
+     *
+     * @param index the operator's position, which is the one identifier that needs no call
+     * @param op    the operator
+     * @return its name, guaranteed non-null and non-blank
+     * @throws StreamException if {@code name()} is absent, blank, or throws
+     */
+    private String requireName(int index, StreamOperator op) throws StreamException {
+        String operatorName;
         try {
-            String n = op.name();
-            return n == null ? op.getClass().getSimpleName() : n;
+            operatorName = op.name();
         } catch (RuntimeException e) {
-            return op.getClass().getSimpleName();
+            throw new StreamException("operator " + index + " of stream pipeline '" + name + "' ("
+                    + op.getClass().getName() + ") threw from name(); an operator's name is read to"
+                    + " build workspace paths and checkpoint keys, so it must be a plain accessor", e);
+        }
+        if (operatorName == null || operatorName.isBlank()) {
+            throw new StreamException("operator " + index + " of stream pipeline '" + name + "' ("
+                    + op.getClass().getName() + ") has no name(); it is needed to name a workspace"
+                    + " directory and to key checkpoints");
+        }
+        return operatorName;
+    }
+
+    /**
+     * Refuses a string that is about to become a single directory name.
+     *
+     * <p>Every value checked here ends up in {@code Paths.get} or {@code Path.resolve}, and some of
+     * what is built there is later handed to a recursive delete. The rejections are not cosmetic:
+     *
+     * <ul>
+     *   <li>{@code ""} — {@code Paths.get("/root", "pipe", "")} collapses to {@code /root/pipe}, so a
+     *       run would take the whole pipeline's directory as its own and reclaiming it would delete
+     *       every other run, including live ones.</li>
+     *   <li>{@code ".."} or any segment containing a separator — escapes the directory it was meant to
+     *       name. {@code Files.walk} does not normalise {@code ..} before deleting.</li>
+     *   <li>Leading or trailing whitespace — two names that look identical resolve to different
+     *       directories, or the same one, depending on the filesystem.</li>
+     * </ul>
+     *
+     * @param what  how to describe the offending value in the message
+     * @param value the candidate segment
+     * @throws StreamException if it cannot safely be one path segment
+     */
+    private static void requirePathSegment(String what, String value) throws StreamException {
+        if (value == null || value.isEmpty()) {
+            throw new StreamException(what + " that is empty, which cannot name a directory");
+        }
+        if (!value.equals(value.trim())) {
+            throw new StreamException(what + " with leading or trailing whitespace: '" + value + "'");
+        }
+        if (".".equals(value) || "..".equals(value)) {
+            throw new StreamException(what + " of '" + value + "', which does not name a directory");
+        }
+        if (value.indexOf('/') >= 0 || value.indexOf('\\') >= 0 || value.indexOf('\0') >= 0) {
+            throw new StreamException(what + " that cannot be used as a single path segment: '"
+                    + value + "'");
         }
     }
 
-    /** Telemetry must never fail a transfer, on either path. */
-    private void reportStagesQuietly(JobContext job, List<StageStream> stages) {
+    /**
+     * An operator's name for a <b>teardown log line</b>, never for anything durable.
+     *
+     * <p>One caller: {@link #destroy()}, which has no stage index to hand and is already reporting a
+     * failure it must not replace. A connector-backed stage is resolved from its template per run and
+     * never cached, so the instance being destroyed need not be the instance {@link #validate()}
+     * proved well-behaved — hence the defensive read, which does not stay quiet about it.
+     *
+     * <p>Everything durable uses {@link #stageNameAt}, including failure attribution. See
+     * {@link #sinkName()} for why.
+     */
+    private String nameForDiagnosis(StreamOperator op) {
+        try {
+            String operatorName = op.name();
+            if (operatorName != null && !operatorName.isBlank()) {
+                return operatorName;
+            }
+            log.warn("operator " + op.getClass().getName() + " of stream pipeline '" + name + "' has"
+                    + " no name() while a failure is being attributed; using its class name");
+        } catch (RuntimeException e) {
+            log.warn("operator " + op.getClass().getName() + " of stream pipeline '" + name + "' threw"
+                    + " from name() while a failure is being attributed; using its class name", e);
+        }
+        return op.getClass().getSimpleName();
+    }
+
+    /**
+     * Reports every stage, sink included. Telemetry must never fail a transfer, on either path.
+     *
+     * <p>The sink needs its own arithmetic because it is the one stage with no {@link StageStream}
+     * around it: it consumes a stream rather than producing one, so there is nothing to decorate. Its
+     * wall time is the whole run — everything upstream executes inside {@code consume()} — so its own
+     * cost is that elapsed time minus the time the stage below it accumulated. Exactly the subtraction
+     * {@link StageStream#selfNanos()} performs, one level further out.
+     *
+     * @param sinkStage        the sink's stage name, or {@code null} when the pipeline has no sink
+     * @param sinkElapsedNanos wall time inside {@code consume()}, or negative if it never started
+     */
+    private void reportStagesQuietly(JobContext job, List<StageStream> stages, String sinkStage,
+                                     long sinkElapsedNanos) {
         for (StageStream s : stages) {
             try {
                 job.stageFinished(s.stage(), s.bytesIn(), s.bytes(), s.selfNanos());
             } catch (Throwable t) {
                 log.warn("Failed to report stage '" + s.stage() + "'; continuing", t);
             }
+        }
+
+        if (sinkStage == null || sinkElapsedNanos < 0L) {
+            return;
+        }
+        try {
+            // The stage the sink read from. Empty only when a resume released every upstream stage.
+            StageStream top = stages.isEmpty() ? null : stages.get(stages.size() - 1);
+            long consumed = top == null ? 0L : top.bytes();
+            long upstreamNanos = top == null ? 0L : top.totalNanos();
+
+            // bytesOut equals bytesIn by construction, not by measurement: a sink writes to somewhere
+            // this class cannot see, so the only honest figure is what it was handed.
+            job.stageFinished(sinkStage, consumed, consumed,
+                    Math.max(0L, sinkElapsedNanos - upstreamNanos));
+        } catch (Throwable t) {
+            log.warn("Failed to report sink stage '" + sinkStage + "'; continuing", t);
         }
     }
 
@@ -753,14 +1336,6 @@ public class StreamPipeline implements ManagedLifecycle {
     }
 
     /**
-     * Adds an operator, with an explicit bound on how much work a failure may cost.
-     *
-     * @param op             the operator
-     * @param nameIsExplicit whether its name was written down rather than derived from position
-     * @param maxReprocessed the deployer's bound in the operator's checkpoint unit, or {@code null}
-     *                       to take the operator's default
-     */
-    /**
      * Where materialised artifacts are written beneath.
      *
      * <p>Normally set by {@link #init} from {@code synapse.properties}. Exposed so a programmatically
@@ -770,10 +1345,47 @@ public class StreamPipeline implements ManagedLifecycle {
         this.workspaceRoot = root;
     }
 
+    /**
+     * Where stage scratch directories go, overriding the default of a temporary directory inside the
+     * workspace.
+     *
+     * <p>Normally set by {@link #init} from {@code synapse.properties}. Exposed for the same reason
+     * {@link #setWorkspaceRoot} is: a programmatically assembled pipeline needs one without a
+     * properties file.
+     */
+    public void setScratchRoot(String root) {
+        this.scratchRoot = root;
+    }
+
+    /**
+     * Records that the structural rules have been checked.
+     *
+     * <p>Refuses a pipeline whose stages are still deferred, because {@code validated} is also what
+     * {@link #bindDeferredStages} tests to decide whether binding is still owed. Setting it early would
+     * skip binding altogether, leaving the operator list empty and the first read of it throwing
+     * {@code IndexOutOfBoundsException} from somewhere that says nothing about the cause.
+     *
+     * @throws IllegalStateException if any stage is still reached through an unbound connector template
+     */
     public void markValidated() {
+        if (hasDeferredStages()) {
+            throw new IllegalStateException("stream pipeline '" + name + "' still has stages to bind"
+                    + " through a connector template, so it cannot be marked validated yet; validation"
+                    + " happens in init(), after the library deployer has run");
+        }
         this.validated = true;
     }
 
+    /**
+     * Adds an operator, with an explicit bound on how much work a failure may cost.
+     *
+     * @param op             the operator
+     * @param nameIsExplicit whether its name was written down rather than derived from position
+     * @param maxReprocessed the deployer's bound in the operator's checkpoint unit, or {@code null}
+     *                       to take the operator's default
+     * @throws IllegalArgumentException if the operator is null, the bound is below 1, or
+     *                                  {@code name()} throws
+     */
     public void addOperator(StreamOperator op, boolean nameIsExplicit, Integer maxReprocessed) {
         if (op == null) {
             throw new IllegalArgumentException("cannot add a null operator to pipeline '" + name + "'");
@@ -781,9 +1393,20 @@ public class StreamPipeline implements ManagedLifecycle {
         if (maxReprocessed != null && maxReprocessed < 1) {
             throw new IllegalArgumentException("maxReprocessed must be at least 1: " + maxReprocessed);
         }
+        // Read once. This runs before validate(), so it is the earliest point a broken name() can be
+        // reported, and the message has to carry the class because there is no name to identify it by.
+        String operatorName;
+        try {
+            operatorName = op.name();
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("operator " + op.getClass().getName() + " threw from"
+                    + " name() while being added to stream pipeline '" + name + "'; a name is read to"
+                    + " build workspace paths and checkpoint keys, so it must be a plain accessor", e);
+        }
         operators.add(op);
-        entries.add(OperatorEntry.ofOperator(op, op.name()));
+        entries.add(OperatorEntry.ofOperator(op, operatorName));
         explicitNames.add(nameIsExplicit);
+        stageNames.add(operatorName);
         this.maxReprocessed.add(maxReprocessed);
     }
 
@@ -801,12 +1424,14 @@ public class StreamPipeline implements ManagedLifecycle {
      * @param maxReprocessed the deployer's bound, or {@code null} for the default
      */
     public void addOperation(org.apache.synapse.mediators.template.InvokeMediator invoke,
-                             String elementName, boolean nameIsExplicit, Integer maxReprocessed) {
+                             String elementName, String stageName, boolean nameIsExplicit,
+                             Integer maxReprocessed) {
         if (invoke == null) {
             throw new IllegalArgumentException("cannot add a null operation to pipeline '" + name + "'");
         }
         entries.add(OperatorEntry.ofOperation(invoke, elementName));
         explicitNames.add(nameIsExplicit);
+        stageNames.add(stageName == null || stageName.trim().isEmpty() ? elementName : stageName.trim());
         this.maxReprocessed.add(maxReprocessed);
     }
 
@@ -916,6 +1541,15 @@ public class StreamPipeline implements ManagedLifecycle {
     /** The operators, in chain order. */
     public List<StreamOperator> getOperators() {
         return Collections.unmodifiableList(operators);
+    }
+
+    /** What to do when a retry finds a different source than the attempt it resumes. */
+    public SourceIdentityPolicy getSourceIdentity() {
+        return sourceIdentity;
+    }
+
+    public void setSourceIdentity(SourceIdentityPolicy policy) {
+        this.sourceIdentity = policy == null ? SourceIdentityPolicy.WARN : policy;
     }
 
     public boolean isSourceProvided() {

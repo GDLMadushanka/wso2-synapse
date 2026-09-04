@@ -73,6 +73,34 @@ public interface JobContext {
     }
 
     /**
+     * Overrides the invoker's <b>kind</b>, when the framework cannot work it out for itself.
+     *
+     * <p><b>Return {@code null} unless you are certain.</b> The framework derives this from the message
+     * context — Synapse stamps the invoking proxy, API or inbound endpoint onto it — and a derived value
+     * cannot be forgotten, which is the whole point. An earlier version of this method asked every
+     * caller to declare the answer, no caller did, and the column held one value forever.
+     *
+     * <p>The case that genuinely needs it is a <b>message processor</b>, whose message context is
+     * synthesised and carries none of those properties. That is a framework component, so the
+     * declaration cannot be omitted by a user.
+     *
+     * @return {@code API}, {@code INBOUND}, {@code PROXY}, {@code PROCESSOR}, or {@code null} to derive
+     * @see #invokerName()
+     */
+    default String invokerType() {
+        return null;
+    }
+
+    /**
+     * Overrides the invoker's <b>name</b>. Same rule as {@link #invokerType()}: {@code null} to derive.
+     *
+     * @return the invoking artifact's name, or {@code null} to derive
+     */
+    default String invokerName() {
+        return null;
+    }
+
+    /**
      * Total expected byte count, or {@code null} when unknown.
      *
      * @return the expected size, or {@code null} — see the class javadoc

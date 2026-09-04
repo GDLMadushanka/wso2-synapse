@@ -21,6 +21,7 @@ package org.apache.synapse.config.xml.stream;
 import org.apache.axiom.om.OMElement;
 import org.apache.axiom.om.util.AXIOMUtil;
 import org.apache.synapse.SynapseException;
+import org.apache.synapse.stream.SourceIdentityPolicy;
 import org.apache.synapse.stream.pipeline.StreamPipeline;
 import org.apache.synapse.config.xml.MediatorFactoryFinder;
 import org.apache.synapse.libraries.imports.SynapseImport;
@@ -224,10 +225,111 @@ public class StreamPipelineFactoryTest {
     public void stripsFrameworkAttributesBeforeTheOperatorFactorySeesThem() throws Exception {
         StreamPipeline p = build("<streamPipeline name=\"ingest\" " + NS + ">"
                 + "<test.classpathSource/>"
-                + "<test.classpathSink materialize=\"true\"/>"
+                + "<test.classpathSink materialize=\"false\" maxReprocessed=\"10\"/>"
                 + "</streamPipeline>");
 
         assertEquals(2, p.getOperators().size());
+    }
+
+    /**
+     * The spill materialize="true" asks for is not implemented, so accepting it silently gave the
+     * deployer a pipeline that still re-runs from stage 1 on failure while looking configured
+     * otherwise. It is refused until the spill exists.
+     */
+    @Test
+    public void refusesMaterializeTrueWhileSpillsAreNotImplemented() throws Exception {
+        try {
+            build("<streamPipeline name=\"ingest\" " + NS + ">"
+                    + "<test.classpathSource/>"
+                    + "<test.classpathSink materialize=\"true\"/>"
+                    + "</streamPipeline>");
+            fail("expected materialize=\"true\" to be refused");
+        } catch (SynapseException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("not implemented yet"));
+        }
+    }
+
+    /** A reserved attribute is still an attribute: a typo in its value must not deploy. */
+    @Test
+    public void refusesAGarbageMaterializeValue() throws Exception {
+        try {
+            build("<streamPipeline name=\"ingest\" " + NS + ">"
+                    + "<test.classpathSource/>"
+                    + "<test.classpathSink materialize=\"banana\"/>"
+                    + "</streamPipeline>");
+            fail("expected a non-boolean materialize value to be refused");
+        } catch (SynapseException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("expected \"true\" or \"false\""));
+        }
+    }
+
+    /**
+     * sourceIdentity was parsed by this factory and rejected by its own unknown-attribute whitelist,
+     * so the feature could not be configured at all — and the serializer emitted it, producing an
+     * artifact file that would not deploy on the next restart.
+     */
+    @Test
+    public void acceptsSourceIdentity() throws Exception {
+        // strict needs a caller-supplied seed to compare against, hence sourceProvided.
+        StreamPipeline p = build("<streamPipeline name=\"ingest\" sourceProvided=\"true\""
+                + " sourceIdentity=\"strict\" " + NS + ">"
+                + "<test.classpathSink/>"
+                + "</streamPipeline>");
+
+        assertEquals(SourceIdentityPolicy.STRICT, p.getSourceIdentity());
+    }
+
+    @Test
+    public void acceptsSourceIdentityOffOnASelfSourcingPipeline() throws Exception {
+        StreamPipeline p = build("<streamPipeline name=\"ingest\" sourceIdentity=\"off\" " + NS + ">"
+                + "<test.classpathSource/><test.classpathSink/></streamPipeline>");
+
+        assertEquals(SourceIdentityPolicy.OFF, p.getSourceIdentity());
+    }
+
+    /**
+     * A pipeline that opens its own source records no source identity, so there is nothing for a later
+     * attempt to be compared against. strict promises to refuse a changed source; it could not, and sat
+     * inert instead. Refused at deployment rather than silently doing nothing.
+     */
+    @Test
+    public void refusesStrictOnAPipelineThatOpensItsOwnSource() throws Exception {
+        try {
+            build("<streamPipeline name=\"ingest\" sourceIdentity=\"strict\" " + NS + ">"
+                    + "<test.classpathSource/><test.classpathSink/></streamPipeline>");
+            fail("strict cannot be honoured without a caller-supplied identity");
+        } catch (SynapseException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("opens its own source"));
+        }
+    }
+
+    @Test
+    public void refusesAnUnknownSourceIdentity() throws Exception {
+        try {
+            build("<streamPipeline name=\"ingest\" sourceIdentity=\"maybe\" " + NS + ">"
+                    + "<test.classpathSource/><test.classpathSink/></streamPipeline>");
+            fail("expected an unknown policy to be refused");
+        } catch (SynapseException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("strict"));
+        }
+    }
+
+    /**
+     * The reserved attributes are stripped off the live element, so the stored source element has to be
+     * cloned BEFORE that happens. Cloning after lost maxReprocessed, and the deployer's
+     * restoreSynapseArtifact writes that lossy copy back to disk — silently reverting a stage from one
+     * fsync per thousand records to one per record.
+     */
+    @Test
+    public void keepsReservedStageAttributesInTheSerializedForm() throws Exception {
+        StreamPipeline p = build("<streamPipeline name=\"ingest\" " + NS + ">"
+                + "<test.classpathSource/>"
+                + "<test.classpathSink maxReprocessed=\"1000\"/>"
+                + "</streamPipeline>");
+
+        String serialized = StreamPipelineSerializer.serializeStreamPipeline(null, p).toString();
+        assertTrue("maxReprocessed must survive a round trip: " + serialized,
+                serialized.contains("maxReprocessed=\"1000\""));
     }
 
     /**

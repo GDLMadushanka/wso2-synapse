@@ -145,17 +145,67 @@ public class ResourceScope implements Closeable {
             return;
         }
         entries.remove(found);
+        releaseOne(found);
+    }
+
+    /** How many resources are registered. A watermark for {@link #closeNowRegisteredBefore}. */
+    public int registered() {
+        return entries.size();
+    }
+
+    /**
+     * Releases every resource registered before a watermark, newest of those first.
+     *
+     * <p>This is what actually frees a resumed run's orphaned upstream, and it exists because
+     * {@link #closeNow} could not. The pipeline holds {@code StageStream} decorators, not the streams
+     * operators registered here, so matching by identity found nothing and released nothing — while
+     * logging that it had. What the pipeline does know is <b>when</b>: everything registered before the
+     * stage that resumed belongs to a segment nothing will read.
+     *
+     * <p>Committing resources among them are aborted rather than closed, for the reason
+     * {@link #closeNow} gives: an abandoned upstream must publish nothing.
+     *
+     * @param mark a value previously returned by {@link #registered()}
+     */
+    public void closeNowRegisteredBefore(int mark) {
+        if (mark <= 0 || entries.isEmpty()) {
+            return;
+        }
+        int keepCount = Math.max(0, entries.size() - mark);
+        Deque<Entry> keep = new ArrayDeque<>();
+        List<Entry> release = new ArrayList<>();
+
+        int index = 0;
+        for (Entry e : entries) {                       // iterates newest first
+            if (index < keepCount) {
+                keep.addLast(e);                        // preserving newest-first order
+            } else {
+                release.add(e);
+            }
+            index++;
+        }
+
+        entries.clear();
+        for (Entry e : keep) {
+            entries.addLast(e);
+        }
+        for (Entry e : release) {                       // already newest-first
+            releaseOne(e);
+        }
+    }
+
+    private void releaseOne(Entry entry) {
         try {
-            if (found.committing) {
+            if (entry.committing) {
                 // Abandoned, not completed — so discard. Closing would publish: this is the same
                 // defect abort() exists for, reached by a different path. An orphaned upstream from
                 // a resumed run has produced nothing anybody should read.
-                ((StreamCommit) found.resource).abort();
+                ((StreamCommit) entry.resource).abort();
             } else {
-                found.resource.close();
+                entry.resource.close();
             }
         } catch (Throwable t) {
-            log.warn("Failed to close '" + found.name + "' early; it is being abandoned", t);
+            log.warn("Failed to close '" + entry.name + "' early; it is being abandoned", t);
         }
     }
 

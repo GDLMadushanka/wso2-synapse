@@ -206,6 +206,18 @@ public final class SynapseConstants {
          */
         public static final String STREAM_WORKSPACE_ROOT = "mft.workspace.root";
 
+        /**
+         * Root directory for stage scratch space, from synapse.properties. Optional: absent means a
+         * temporary directory inside the workspace.
+         *
+         * <p>Worth configuring separately for one reason. Scratch is <b>node-local by definition</b> —
+         * nothing ever resumes from it, so no other node needs to see it — while the workspace is a
+         * cluster-mounted share. An external merge sort is exactly the workload that punishes the
+         * difference: many files, heavy reads during the merge, all of it over NFS unless pointed
+         * somewhere local.
+         */
+        public static final String STREAM_SCRATCH_ROOT = "mft.scratch.root";
+
     //- Synapse Message Context Properties -
         /** The Synapse MC property keep the response state */
         public static final String RESPONSE_STATE = "__SYNAPSE_RESPONSE_STATE__";

@@ -24,6 +24,7 @@ import org.apache.axiom.om.OMFactory;
 import org.apache.axiom.om.OMNamespace;
 import org.apache.synapse.SynapseException;
 import org.apache.synapse.config.xml.XMLConfigConstants;
+import org.apache.synapse.stream.SourceIdentityPolicy;
 import org.apache.synapse.stream.pipeline.StreamPipeline;
 
 import javax.xml.namespace.QName;
@@ -74,9 +75,15 @@ public class StreamPipelineSerializer {
         // cleanly in version control.
         removeAttribute(out, "name");
         removeAttribute(out, "sourceProvided");
+        removeAttribute(out, "sourceIdentity");
         out.addAttribute(FACTORY.createOMAttribute("name", null, pipeline.getName()));
         if (pipeline.isSourceProvided()) {
             out.addAttribute(FACTORY.createOMAttribute("sourceProvided", null, "true"));
+        }
+        // Written only when it is not the default, so an artifact nobody configured stays as authored.
+        if (pipeline.getSourceIdentity() != SourceIdentityPolicy.WARN) {
+            out.addAttribute(FACTORY.createOMAttribute("sourceIdentity", null,
+                    pipeline.getSourceIdentity().name().toLowerCase(java.util.Locale.ROOT)));
         }
 
         if (parent != null) {

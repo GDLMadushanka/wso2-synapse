@@ -28,6 +28,7 @@ import org.apache.synapse.config.xml.XMLConfigConstants;
 import org.apache.synapse.Mediator;
 import org.apache.synapse.config.xml.MediatorFactoryFinder;
 import org.apache.synapse.mediators.template.InvokeMediator;
+import org.apache.synapse.stream.SourceIdentityPolicy;
 import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamOperator;
 import org.apache.synapse.stream.pipeline.StreamPipeline;
@@ -63,6 +64,7 @@ public class StreamPipelineFactory {
 
     private static final QName ATT_NAME = new QName("name");
     private static final QName ATT_SOURCE_PROVIDED = new QName("sourceProvided");
+    private static final QName ATT_SOURCE_IDENTITY = new QName("sourceIdentity");
     /**
      * Attributes the <b>framework</b> reads off a stage, which the operator never sees.
      * <p>
@@ -113,16 +115,31 @@ public class StreamPipelineFactory {
                     provided.getAttributeValue()));
         }
 
+        OMAttribute identity = elem.getAttribute(ATT_SOURCE_IDENTITY);
+        if (identity != null) {
+            SourceIdentityPolicy policy = SourceIdentityPolicy.parse(identity.getAttributeValue());
+            if (policy == null) {
+                throw new SynapseException("stream pipeline '" + pipeline.getName() + "' has"
+                        + " 'sourceIdentity=\"" + identity.getAttributeValue() + "\"'; expected"
+                        + " \"strict\", \"warn\" or \"off\"");
+            }
+            pipeline.setSourceIdentity(policy);
+        }
+
+        // Cloned BEFORE buildOperators, which strips the framework-reserved stage attributes off the
+        // live element it is handed. Cloning afterwards stored a copy with 'materialize' and
+        // 'maxReprocessed' already removed, so a serialize-and-write-back — which
+        // StreamPipelineDeployer.restoreSynapseArtifact does — silently reverted a stage configured
+        // maxReprocessed="1000" to the default of 1, changing one fsync per thousand records into one
+        // per record with nothing logged.
+        pipeline.setSourceElement(elem.cloneOMElement());
+
         try {
             buildOperators(pipeline, elem, properties);
         } catch (StreamException e) {
             throw new SynapseException("stream pipeline '" + pipeline.getName() + "': "
                     + e.getMessage(), e);
         }
-
-        // Keep the source element so the serializer can round-trip operator configuration without
-        // every operator author having to write a serializer. See StreamPipelineSerializer.
-        pipeline.setSourceElement(elem.cloneOMElement());
 
         // A pipeline with a connector operation in it cannot be validated yet: the operator lives in a
         // template the library deployer has not created, so we do not know its role. init() validates
@@ -159,6 +176,29 @@ public class StreamPipelineFactory {
      *
      * <p>What we do owe the deployer is visibility, so any widening is logged at deployment.
      */
+    /**
+     * Refuses {@code materialize="true"} while the spill it asks for is not implemented.
+     *
+     * <p>The attribute is reserved and stripped, so it used to be read and thrown away. A deployer who
+     * set it to bound restart cost got no segment boundary, no spill and no warning — a transfer that
+     * still re-ran from stage 1 on failure, configured to do otherwise. Silence there is worse than a
+     * refusal, because the configuration looks honoured.
+     *
+     * <p>{@code "false"} is accepted: it asks for the behaviour that already happens. A value that is
+     * neither is a typo and is refused as one.
+     */
+    private static void rejectUnhonouredMaterialize(String pipelineName, int index, String value) {
+        if (value == null) {
+            return;
+        }
+        if (parseBoolean(pipelineName, "materialize", value)) {
+            throw new SynapseException("stream pipeline '" + pipelineName + "' operator " + index
+                    + " sets materialize=\"true\", but framework-inserted spills are not implemented"
+                    + " yet, so nothing would happen. Remove it, or declare materialises() on the"
+                    + " operator to get a real segment boundary");
+        }
+    }
+
     private static Integer parseMaxReprocessed(String pipelineName, int index,
                                                StreamOperator operator, String value) {
         if (value == null) {
@@ -209,7 +249,8 @@ public class StreamPipelineFactory {
 
             // Read and remove the framework's own attributes before the operator factory sees the
             // element.
-            takeReservedAttribute(childElem, "materialize");   // honoured once spills land
+            rejectUnhonouredMaterialize(pipeline.getName(), index,
+                    takeReservedAttribute(childElem, "materialize"));
             String maxReprocessedAttr = takeReservedAttribute(childElem, "maxReprocessed");
 
             // Whether the name was written down, as opposed to derived from position. Durable state
@@ -244,7 +285,9 @@ public class StreamPipelineFactory {
                         + "> at position " + index + ": " + e.getMessage(), e);
             }
             if (mediator instanceof InvokeMediator invoke) {
-                pipeline.addOperation(invoke, childElem.getLocalName(), nameIsExplicit,
+                OMAttribute nameAttr = childElem.getAttribute(ATT_NAME);
+                pipeline.addOperation(invoke, childElem.getLocalName(),
+                        nameAttr == null ? null : nameAttr.getAttributeValue(), nameIsExplicit,
                         parseMaxReprocessed(pipeline.getName(), index, null, maxReprocessedAttr));
             } else if (mediator instanceof StreamOperator operator) {
                 pipeline.addOperator(operator, nameIsExplicit,
@@ -278,9 +321,10 @@ public class StreamPipelineFactory {
         for (Iterator<?> it = elem.getAllAttributes(); it.hasNext(); ) {
             OMAttribute a = (OMAttribute) it.next();
             String local = a.getQName().getLocalPart();
-            if (!"name".equals(local) && !"sourceProvided".equals(local) && !"key".equals(local)) {
+            if (!"name".equals(local) && !"sourceProvided".equals(local)
+                    && !"sourceIdentity".equals(local) && !"key".equals(local)) {
                 throw new SynapseException("<streamPipeline> has an unknown attribute '" + local
-                        + "'. Known attributes are 'name' and 'sourceProvided'");
+                        + "'. Known attributes are 'name', 'sourceProvided' and 'sourceIdentity'");
             }
         }
     }

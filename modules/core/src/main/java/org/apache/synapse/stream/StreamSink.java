@@ -41,7 +41,7 @@ public interface StreamSink extends StreamOperator {
      *       success on a partial transfer.</li>
      *   <li><b>Do not return before the output is complete.</b> Where the output must be made
      *       durable, register that with
-     *       {@link ResourceScope#registerCommitting(String, java.io.Closeable)} so a failed
+     *       {@link ResourceScope#registerCommitting(String, StreamCommit)} so a failed
      *       commit fails the transfer.</li>
      *   <li><b>Write atomically where you can</b> — temporary name, then rename. Writing
      *       straight to the destination means a failure part-way leaves a truncated artifact,
