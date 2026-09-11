@@ -105,13 +105,19 @@ public interface StageArtifact {
     boolean isComplete() throws IOException;
 
     /**
-     * Opens the completed artifact and tells the pipeline this stage short-circuited to it.
+     * Opens the completed artifact. The returned stream is registered with the run's resource scope.
+     *
+     * <h2>Only the canonical artifact reports a short-circuit</h2>
+     * Opening {@link StreamContext#artifact() the canonical artifact} tells the pipeline this
+     * <b>stage</b> produced its output from a previous run, which releases the upstream stages built
+     * above it that will now never be read. Doing that here rather than asking the operator to
+     * remember is the point: forgetting it holds a remote connection open and unread for the length of
+     * the run, with nothing to indicate it.
      * <p>
-     * The returned stream is registered with the run's resource scope, and
-     * the pipeline is told this stage short-circuited — which is what releases the
-     * upstream stages that were built above this one and will now never be read. Doing both here
-     * rather than asking the operator to remember is the point: forgetting the signal leaks a remote
-     * connection for the length of the run, with nothing to indicate it.
+     * Opening a {@link StreamContext#artifact(String) named} file reports nothing, because it means
+     * nothing about the stage. An external merge sort reads its sealed runs back while phase 1 is
+     * still consuming the input — treating that as a short-circuit would release the upstream it is
+     * reading from.
      *
      * @return a stream over the finished artifact
      * @throws IOException           if it could not be opened
@@ -144,6 +150,37 @@ public interface StageArtifact {
      *                     truncated — neither may be guessed past
      */
     long resumePosition() throws IOException;
+
+    /**
+     * Opens the part of this artifact a previous attempt already produced, so a resumed stage can
+     * hand its downstream the <b>whole</b> output stream rather than only the tail.
+     *
+     * <h2>Why the framework calls this and an operator does not</h2>
+     * A downstream stage counts records of its input from 1 and skips its own recorded position. If a
+     * resumed stage emitted only what it re-derives, that count would land in the wrong place — past
+     * the end of a short stream, or over different records — and rows would vanish with the run
+     * reporting success. Every materialising transform needs this, forgetting it is silent data loss,
+     * and by the argument in this interface's own javadoc that makes it the framework's obligation
+     * rather than an author's. {@code StreamPipeline} concatenates it ahead of the operator's stream;
+     * no operator calls it.
+     *
+     * <h2>It reconciles first</h2>
+     * The reconciliation and truncation of {@link #resumePosition} happen here too, and happen
+     * <b>before</b> any byte is served — the two are the same {@code start()}, so whichever is reached
+     * first does the work and the other sees the result. That ordering is required: serving bytes past
+     * the recorded length would hand a downstream stage output whose position was never recorded.
+     *
+     * <p>The returned stream is <b>bounded</b> to the reconciled length. The operator appends past it
+     * through a separate handle while this is being read, and those bytes must not appear here — they
+     * are the same bytes the operator is about to produce again.
+     *
+     * <p>Performs I/O, so unlike {@link #isComplete()} it must not be called during the build phase —
+     * see invariant 1. The pipeline defers it to the first {@code read()}.
+     *
+     * @return a stream over the already-produced output; empty when there is none
+     * @throws IOException if the artifact could not be reconciled or opened
+     */
+    InputStream openPrefix() throws IOException;
 
     /**
      * Appends one byte to the artifact. Buffered; not durable until {@link #unitDone} says so.

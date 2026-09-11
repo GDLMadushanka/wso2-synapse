@@ -27,7 +27,10 @@ import org.apache.synapse.stream.StreamTransform;
 import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
+import org.apache.synapse.stream.StageArtifact;
+import org.apache.synapse.stream.CheckpointUnit;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -756,6 +759,162 @@ final class Mocks {
                     return n;
                 }
             };
+        }
+    }
+
+    /** Materialises and is deterministic — a csv→json style converter. Legal above a checkpoint. */
+    static final class DeterministicMaterialising implements StreamTransform {
+        private final String name;
+
+        DeterministicMaterialising(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public boolean deterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean materialises() {
+            return true;
+        }
+
+        @Override
+        public InputStream wrap(InputStream upstream, StreamContext ctx) {
+            return new FilterInputStream(upstream) { };
+        }
+    }
+
+    /** A sink that declares materialises() — an artifact nothing could ever read. */
+    static final class MaterialisingSink implements StreamSink {
+        @Override
+        public String name() {
+            return "materialising-sink";
+        }
+
+        @Override
+        public boolean materialises() {
+            return true;
+        }
+
+        @Override
+        public void consume(InputStream in, StreamContext ctx) throws IOException {
+            in.transferTo(OutputStream.nullOutputStream());
+        }
+    }
+
+    /**
+     * A faithful miniature of a materialising, checkpointed transform: one byte in, one byte out, one
+     * record. Appends every record to its artifact, calls {@code unitDone} after the append, and can be
+     * told to fail partway so a resume can be exercised.
+     *
+     * <p>Deliberately does <b>not</b> replay its own artifact prefix — that is the framework's job, and
+     * the point of the test is that no operator has to.
+     */
+    static final class ByteRecords implements StreamTransform {
+
+        private final String name;
+        private final int failAfter;
+        private final AtomicInteger emitted = new AtomicInteger();
+
+        ByteRecords(String name, int failAfter) {
+            this.name = name;
+            this.failAfter = failAfter;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public boolean deterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean checkpointed() {
+            return true;
+        }
+
+        @Override
+        public boolean materialises() {
+            return true;
+        }
+
+        @Override
+        public InputStream wrap(InputStream in, StreamContext ctx) {
+            StageArtifact artifact = ctx.artifact(CheckpointUnit.RECORDS, "bytes-1");
+            return new InputStream() {
+                private long record;
+                private boolean started;
+
+                @Override
+                public int read() throws IOException {
+                    if (!started) {
+                        started = true;
+                        record = artifact.resumePosition();
+                        in.skipNBytes(record);          // one byte per record
+                    }
+                    if (failAfter > 0 && emitted.get() >= failAfter) {
+                        throw new IOException(name + " failed after " + failAfter + " records");
+                    }
+                    int b = in.read();
+                    if (b == -1) {
+                        return -1;
+                    }
+                    record++;
+                    artifact.append(b);                 // 1. staged
+                    artifact.unitDone(record);          // 2. fsync, then advance
+                    emitted.incrementAndGet();
+                    return b;
+                }
+
+                @Override
+                public int read(byte[] b, int off, int len) throws IOException {
+                    if (len == 0) {
+                        return 0;
+                    }
+                    int one = read();
+                    if (one == -1) {
+                        return -1;
+                    }
+                    b[off] = (byte) one;
+                    return 1;                           // one record per read, so the seam is visible
+                }
+
+                @Override
+                public void close() throws IOException {
+                    in.close();
+                }
+            };
+        }
+    }
+
+    /** Refuses during wrap(), as a connector operation does when its configuration is unusable. */
+    static final class FailsWhenBuilt implements StreamTransform {
+
+        private final String name;
+
+        FailsWhenBuilt(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public InputStream wrap(InputStream upstream, StreamContext ctx) throws StreamException {
+            throw new StreamException(name + " needs the invoking message to read its parameters"
+                    + " from", false);
         }
     }
 }

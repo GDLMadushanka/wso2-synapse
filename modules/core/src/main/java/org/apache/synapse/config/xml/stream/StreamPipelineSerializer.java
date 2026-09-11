@@ -76,6 +76,7 @@ public class StreamPipelineSerializer {
         removeAttribute(out, "name");
         removeAttribute(out, "sourceProvided");
         removeAttribute(out, "sourceIdentity");
+        removeAttribute(out, "resume");
         out.addAttribute(FACTORY.createOMAttribute("name", null, pipeline.getName()));
         if (pipeline.isSourceProvided()) {
             out.addAttribute(FACTORY.createOMAttribute("sourceProvided", null, "true"));
@@ -84,6 +85,11 @@ public class StreamPipelineSerializer {
         if (pipeline.getSourceIdentity() != SourceIdentityPolicy.WARN) {
             out.addAttribute(FACTORY.createOMAttribute("sourceIdentity", null,
                     pipeline.getSourceIdentity().name().toLowerCase(java.util.Locale.ROOT)));
+        }
+        // Only ever "false": the factory refuses resume="true", so round-tripping it would emit a
+        // value that will not parse back.
+        if (!pipeline.isResume()) {
+            out.addAttribute(FACTORY.createOMAttribute("resume", null, "false"));
         }
 
         if (parent != null) {

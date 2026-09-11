@@ -103,13 +103,19 @@ public class StageArtifactTest {
                                           ResourceScope scope, AtomicInteger resumeSignals) {
         return new DefaultStageArtifact("stage", dir, "artifact.out", store,
                 store == null ? null : CheckpointUnit.RECORDS, store == null ? null : VERSION,
-                maxReprocessed, scope, resumeSignals::incrementAndGet, false);
+                maxReprocessed, scope, resumeSignals::incrementAndGet, true);
     }
 
     /** A named working file, which unlike the canonical artifact may be sealed mid-run. */
+    private DefaultStageArtifact named(Path dir, String fileName, ResourceScope scope,
+                                       AtomicInteger resumeSignals) {
+        return new DefaultStageArtifact("stage", dir, fileName, null, null, null, 1, scope,
+                resumeSignals::incrementAndGet, false);
+    }
+
     private DefaultStageArtifact named(Path dir, String fileName, ResourceScope scope) {
         return new DefaultStageArtifact("stage", dir, fileName, null, null, null, 1, scope,
-                () -> { }, true);
+                () -> { }, false);
     }
 
     private static void append(StageArtifact artifact, String text) throws IOException {
@@ -410,7 +416,7 @@ public class StageArtifactTest {
     public void aCheckpointOnlyStageNeedsNoWorkspace() throws Exception {
         RecordingStore store = new RecordingStore(Path.of("/nonexistent"));
         StageArtifact artifact = new DefaultStageArtifact("upload", null, "artifact.out", store,
-                CheckpointUnit.BYTES, VERSION, 1, new ResourceScope(), () -> { }, false);
+                CheckpointUnit.BYTES, VERSION, 1, new ResourceScope(), () -> { }, true);
 
         assertFalse("nothing can be complete without a workspace", artifact.isComplete());
         assertEquals(0L, artifact.resumePosition());
@@ -626,6 +632,76 @@ public class StageArtifactTest {
         append(a2, "678");
         assertEquals(8L, a2.length());
         second.close();
+    }
+
+
+    // ------------------------------------------------------- canonical vs named
+
+    /**
+     * Reading back a sealed working file must <b>not</b> report that the stage short-circuited.
+     *
+     * <p>An external merge sort opens its sealed runs while phase 1 is still consuming the input. If
+     * that counted as a short-circuit the pipeline would release the upstream phase 1 is reading
+     * from — the stage's own source, pulled out from under it mid-run.
+     */
+    @Test
+    public void openingANamedFileDoesNotReportAShortCircuit() throws Exception {
+        Path dir = stageDir();
+        AtomicInteger signals = new AtomicInteger();
+        ResourceScope scope = new ResourceScope();
+
+        StageArtifact run0 = named(dir, "run-0", scope, signals);
+        append(run0, "sorted chunk");
+        run0.seal();
+        try (InputStream in = run0.openComplete()) {
+            assertEquals("sorted chunk", new String(in.readAllBytes(), StandardCharsets.UTF_8));
+        }
+
+        assertEquals("a named file says nothing about the stage", 0, signals.get());
+        scope.close();
+    }
+
+    /** The canonical artifact does report it — that is what releases the orphaned upstream. */
+    @Test
+    public void openingTheCanonicalArtifactReportsAShortCircuit() throws Exception {
+        Path dir = stageDir();
+        Files.writeString(finalOf(dir), "from a previous run");
+        AtomicInteger signals = new AtomicInteger();
+        ResourceScope scope = new ResourceScope();
+
+        StageArtifact artifact = artifact(dir, null, 1, scope, signals);
+        try (InputStream in = artifact.openComplete()) {
+            in.readAllBytes();
+        }
+
+        assertEquals(1, signals.get());
+        scope.close();
+    }
+
+    /**
+     * A stage holds several artifacts at once and each commits to its own file.
+     *
+     * <p>Note what this does <b>not</b> pin. These used to register under one scope name,
+     * {@code stage:artifact}, which made a merge sort's run files indistinguishable in the scope and
+     * in every log line about them. That is now {@code stage:run-0} and so on — but the scope neither
+     * deduplicates by name nor exposes the names, so the fix shows up only in a log line and no
+     * assertion here can reach it. What this test does cover is that the artifacts stay separate.
+     */
+    @Test
+    public void aStageCanHoldSeveralArtifactsAtOnce() throws Exception {
+        Path dir = stageDir();
+        ResourceScope scope = new ResourceScope();
+
+        append(named(dir, "run-0", scope), "a");
+        append(named(dir, "run-1", scope), "b");
+        append(artifact(dir, null, 1, scope, new AtomicInteger()), "c");
+
+        assertEquals(3, scope.size());
+        scope.close();
+
+        assertEquals("a", Files.readString(dir.resolve("run-0")));
+        assertEquals("b", Files.readString(dir.resolve("run-1")));
+        assertEquals("c", Files.readString(finalOf(dir)));
     }
 
     /** Two callers must not each hold their own append offset over one file. */

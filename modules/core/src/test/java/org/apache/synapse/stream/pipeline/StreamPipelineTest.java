@@ -37,6 +37,8 @@ import java.nio.file.Path;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -49,6 +51,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -827,8 +830,10 @@ public class StreamPipelineTest {
         JobStores.register(pipelineName -> new JobStore() {
             @Override
             public JobRecord start(JobRun run) {
-                // A previous attempt over a different file, under the same job id.
-                return new JobRecord(run.runId(), "FAILED", 1, "file:/in/a.csv", 16L, 1234L);
+                // A previous attempt over a different file, under the same job id. The recorded
+                // identity is what a file provider composes: the URI plus what distinguishes a
+                // replacement from the original.
+                return new JobRecord(run.runId(), "FAILED", 1, "file:/in/a.csv|16|1234", 16L, 1234L);
             }
         });
         try {
@@ -840,10 +845,11 @@ public class StreamPipelineTest {
             p.addOperator(new Mocks.Sink("sink"), true);
             p.validate();
 
-            // Same job id, a source whose size and mtime differ from what was recorded.
+            // Same job id, a different identity: the file at that path was replaced, and the
+            // provider's identity says so.
             p.execute(null, jobWithId("job-9"),
-                    new StreamSeed(new ByteArrayInputStream(DATA), "file:/in/a.csv", 99L, 5678L,
-                            StreamOrigin.REOPENABLE));
+                    new StreamSeed(new ByteArrayInputStream(DATA), "file:/in/a.csv|99|5678", 99L,
+                            5678L, StreamOrigin.REOPENABLE));
 
             assertTrue("the stale position must be forgotten, not just the artifact",
                     cleared.contains("position"));
@@ -851,6 +857,114 @@ public class StreamPipelineTest {
             CheckpointStores.register(null);
             JobStores.register(null);
         }
+    }
+
+    /**
+     * A size or mtime that moved, under an identity the provider says is unchanged, must <b>not</b>
+     * trip the guard.
+     *
+     * <p>This is the deliberate half of ADR-0033, and the half a future reader will question. The guard
+     * used to compare the recorded identity, size and modification time separately, which meant the
+     * framework held a second opinion about what "the same source" is — and could overrule the
+     * provider with it. A provider that identifies a source by path alone has <i>said</i> that content
+     * at that path is one logical source; discarding its workspace because the size changed contradicts
+     * a decision that was never the framework's to make.
+     *
+     * <p>The provider that wants the old behaviour gets it by folding size and mtime into the identity,
+     * which is what {@link #warnClearsTheCheckpointAndNotJustTheWorkspace()} shows.
+     */
+    @Test
+    public void aChangedSizeUnderAnUnchangedIdentityIsNotAChangedSource() throws Exception {
+        List<String> cleared = new ArrayList<>();
+        CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
+            @Override
+            public Checkpoint lastComplete() {
+                return null;
+            }
+
+            @Override
+            public void append(Checkpoint checkpoint) {
+            }
+
+            @Override
+            public void clear() {
+                cleared.add(stageName);
+            }
+        });
+        JobStores.register(pipelineName -> new JobStore() {
+            @Override
+            public JobRecord start(JobRun run) {
+                // Identity is the path alone - this provider's choice - while the telemetry differs.
+                return new JobRecord(run.runId(), "FAILED", 1, "file:/in/a.csv", 16L, 1234L);
+            }
+        });
+        try {
+            Path root = Files.createTempDirectory("mft-same-identity");
+            StreamPipeline p = pipeline("same-identity");
+            p.setWorkspaceRoot(root.toString());
+            p.setSourceProvided(true);
+            p.addOperator(new Mocks.Checkpointing("position"), true);
+            p.addOperator(new Mocks.Sink("sink"), true);
+            p.validate();
+
+            p.execute(null, jobWithId("job-9"),
+                    new StreamSeed(new ByteArrayInputStream(DATA), "file:/in/a.csv", 99L, 5678L,
+                            StreamOrigin.REOPENABLE));
+
+            assertTrue("the provider said this is the same source; the framework must not disagree",
+                    cleared.isEmpty());
+        } finally {
+            CheckpointStores.register(null);
+            JobStores.register(null);
+        }
+    }
+
+    /**
+     * The run id is a hash of the identity and the pipeline name, and of nothing else.
+     *
+     * <p>It used to fold in the seed's size and modification time too, which made an email attachment
+     * hash {@code UNKNOWN} twice and diluted an identity already stronger than the composition could
+     * express.
+     */
+    @Test
+    public void theRunIdHashesTheIdentityAndNothingElse() throws Exception {
+        StreamPipeline p = pipeline("run-id");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+
+        StreamPipeline.RunId a = p.resolveRunId(JobContext.NOOP,
+                new StreamSeed(new ByteArrayInputStream(DATA), "imap://h/INBOX|uidvalidity=1|uid=7",
+                        StreamSeed.UNKNOWN, StreamSeed.UNKNOWN, StreamOrigin.REOPENABLE),
+                StreamOrigin.REOPENABLE);
+        StreamPipeline.RunId b = p.resolveRunId(JobContext.NOOP,
+                new StreamSeed(new ByteArrayInputStream(DATA), "imap://h/INBOX|uidvalidity=1|uid=7",
+                        4096L, 1700000000000L, StreamOrigin.REOPENABLE),
+                StreamOrigin.REOPENABLE);
+
+        assertEquals("size and mtime must not reach the run id", a.value(), b.value());
+        assertTrue(a.stable());
+
+        StreamPipeline.RunId other = p.resolveRunId(JobContext.NOOP,
+                new StreamSeed(new ByteArrayInputStream(DATA), "imap://h/INBOX|uidvalidity=1|uid=8",
+                        StreamSeed.UNKNOWN, StreamSeed.UNKNOWN, StreamOrigin.REOPENABLE),
+                StreamOrigin.REOPENABLE);
+        assertNotEquals("a different identity is a different run", a.value(), other.value());
+    }
+
+    /** No identity means nothing can be looked up later, however re-readable the bytes are. */
+    @Test
+    public void aSeedWithoutAnIdentityIsNotResumable() throws Exception {
+        StreamPipeline p = pipeline("no-identity");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+
+        StreamPipeline.RunId id = p.resolveRunId(JobContext.NOOP,
+                new StreamSeed(new ByteArrayInputStream(DATA), null, 10L, 20L,
+                        StreamOrigin.REOPENABLE),
+                StreamOrigin.REOPENABLE);
+
+        assertFalse("a source that cannot be recognised cannot be resumed", id.stable());
+        assertTrue(id.value().startsWith("run-"));
     }
 
     // ------------------------------------------------------------------ telemetry
@@ -936,6 +1050,316 @@ public class StreamPipelineTest {
      * A job context with a real id. Required by any pipeline whose operators keep durable state —
      * NOOP's placeholder id is shared by every run, so it cannot name a workspace.
      */
+    /**
+     * A failure while building a stage is attributed to <b>that</b> stage.
+     *
+     * <p>It used to reach the outer handler unattributed, which assumes the sink — right for the pull
+     * phase, wrong here. A {@code forEach} refusing its configuration was reported against a file sink
+     * three stages away, which sends whoever reads the log to the wrong operator.
+     */
+    @Test
+    public void aBuildFailureNamesTheStageThatFailed() throws Exception {
+        StreamPipeline p = pipeline("build-blame");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.PassThrough("first"), true);
+        p.addOperator(new Mocks.FailsWhenBuilt("culprit"), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+        try {
+            p.execute(null, JobContext.NOOP, seedOf("ABC"));
+            fail("expected the build to fail");
+        } catch (StreamException e) {
+            assertEquals("the stage that failed, not the sink", "culprit", e.getStage());
+        }
+    }
+
+    // ------------------------------------------------------------ resume: artifact prefix replay
+
+    /**
+     * A resumed materialising stage hands its downstream the <b>whole</b> stream it produced, not only
+     * the part it re-derives.
+     *
+     * <p>Ten records, a checkpoint every three, failing after seven. The stage checkpointed at 6, so on
+     * resume it truncates to six records' worth of bytes, replays those six from the artifact, and
+     * re-derives 7..10. The sink must see all ten.
+     *
+     * <p>Without the replay the sink sees {@code HIJ} only — a silently short output with the run
+     * reporting success, which is the defect this exists to catch.
+     */
+    @Test
+    public void aResumedStageReplaysItsArtifactBeforeItsLiveOutput() throws Exception {
+        MemoryCheckpoints store = new MemoryCheckpoints();
+        store.install();
+        try {
+            Path root = Files.createTempDirectory("mft-prefix-replay");
+
+            Mocks.Sink first = new Mocks.Sink("sink");
+            StreamPipeline failing = prefixPipeline(root, first, 7);
+            try {
+                failing.execute(null, jobWithId("job-replay"), seedOf("ABCDEFGHIJ"));
+                fail("the first attempt was supposed to fail after seven records");
+            } catch (StreamException expected) {
+                assertEquals("rows", expected.getStage());
+            }
+
+            Mocks.Sink second = new Mocks.Sink("sink");
+            StreamPipeline resuming = prefixPipeline(root, second, 0);
+            resuming.execute(null, jobWithId("job-replay"), seedOf("ABCDEFGHIJ"));
+
+            assertEquals("the downstream must receive every record, prefix then live",
+                    "ABCDEFGHIJ", textOf(second));
+        } finally {
+            store.uninstall();
+        }
+    }
+
+    /** And the seam is invisible: a fresh run and a resumed run produce identical output. */
+    @Test
+    public void aResumedRunProducesWhatAnUninterruptedRunWould() throws Exception {
+        MemoryCheckpoints store = new MemoryCheckpoints();
+        store.install();
+        try {
+            Path clean = Files.createTempDirectory("mft-clean");
+            Mocks.Sink once = new Mocks.Sink("sink");
+            prefixPipeline(clean, once, 0).execute(null, jobWithId("job-clean"), seedOf("ABCDEFGHIJ"));
+
+            Path broken = Files.createTempDirectory("mft-broken");
+            Mocks.Sink partial = new Mocks.Sink("sink");
+            try {
+                prefixPipeline(broken, partial, 4)
+                        .execute(null, jobWithId("job-broken"), seedOf("ABCDEFGHIJ"));
+                fail("expected the first attempt to fail");
+            } catch (StreamException ignored) {
+                // expected
+            }
+            Mocks.Sink retried = new Mocks.Sink("sink");
+            prefixPipeline(broken, retried, 0)
+                    .execute(null, jobWithId("job-broken"), seedOf("ABCDEFGHIJ"));
+
+            assertEquals("a resume must be indistinguishable from never having failed",
+                    textOf(once), textOf(retried));
+        } finally {
+            store.uninstall();
+        }
+    }
+
+    private static String textOf(Mocks.Sink sink) {
+        byte[] bytes = new byte[sink.received.size()];
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = sink.received.get(i);
+        }
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private static StreamPipeline prefixPipeline(Path root, Mocks.Sink sink, int failAfter)
+            throws Exception {
+        StreamPipeline p = pipeline("replay");
+        p.setSourceProvided(true);
+        p.setWorkspaceRoot(root.toString());
+        p.addOperator(new Mocks.ByteRecords("rows", failAfter), true, 3);
+        p.addOperator(sink, true);
+        p.validate();
+        return p;
+    }
+
+    private static StreamSeed seedOf(String text) {
+        return new StreamSeed(new ByteArrayInputStream(text.getBytes(StandardCharsets.UTF_8)),
+                "mem:/" + text.length(), text.length(), 1L, StreamOrigin.REOPENABLE);
+    }
+
+    /** A checkpoint store that survives between two execute() calls, as the database would. */
+    private static final class MemoryCheckpoints {
+        private final Map<String, Checkpoint> rows = new HashMap<>();
+
+        void install() {
+            CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
+                private final String key = runId + "/" + stageName;
+
+                @Override
+                public Checkpoint lastComplete() {
+                    return rows.get(key);
+                }
+
+                @Override
+                public void append(Checkpoint checkpoint) {
+                    rows.put(key, checkpoint);
+                }
+
+                @Override
+                public void clear() {
+                    rows.remove(key);
+                }
+            });
+        }
+
+        void uninstall() {
+            CheckpointStores.register(null);
+        }
+    }
+
+    // ------------------------------------------------------------ scratch reclamation
+
+    /**
+     * A run that cannot resume forgets its positions, not only its files.
+     *
+     * <p>Checkpoints live in the database, so discarding the workspace never touched them — and a
+     * stage that is {@code checkpointed()} without {@code materialises()} has no artifact for
+     * {@code L <= A} to catch a stale position against. With {@code resume="false"} the run id is
+     * still derived from the source's identity, so the next attempt lands on the same key and would
+     * skip records the deployer asked to have re-run.
+     */
+    @Test
+    public void aNonResumableRunClearsItsCheckpointsEvenWithNoWorkspace() throws Exception {
+        List<String> cleared = new ArrayList<>();
+        CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
+            @Override
+            public Checkpoint lastComplete() {
+                return null;
+            }
+
+            @Override
+            public void append(Checkpoint checkpoint) {
+            }
+
+            @Override
+            public void clear() {
+                cleared.add(stageName);
+            }
+        });
+        try {
+            StreamPipeline p = pipeline("scratch-ckpt");
+            p.setSourceProvided(true);
+            p.setResume(false);                       // the run is scratch however stable its id
+            p.addOperator(new Mocks.CheckpointingSink("upsert"), true);
+            p.validate();
+
+            p.execute(null, JobContext.NOOP,
+                    new StreamSeed(new ByteArrayInputStream(DATA), "file:/in/a.csv|16|1234", 16L,
+                            1234L, StreamOrigin.REOPENABLE));
+
+            assertTrue("a scratch run must not leave a position for the next attempt to resume from",
+                    cleared.contains("upsert"));
+        } finally {
+            CheckpointStores.register(null);
+        }
+    }
+
+    // ------------------------------------------------------------ ADR-0034 and the G2 sink rule
+
+    /**
+     * A checkpointed stage below a non-deterministic materialising one is refused at deployment.
+     *
+     * <p>Its position counts records of the stage above. A partial resume re-derives that stage's
+     * unpersisted tail, which may differ, so the position would skip records of different bytes —
+     * silently. ADR-0034.
+     */
+    @Test
+    public void aCheckpointBelowANonDeterministicMaterialisingStageIsRefused() {
+        StreamPipeline p = pipeline("nd-above");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.Checkpointing("forEach"), true);      // materialises, not deterministic
+        p.addOperator(new Mocks.CheckpointingSink("sink"), true);
+        try {
+            p.validate();
+            fail("expected the checkpoint below a non-deterministic materialising stage to be refused");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("without declaring deterministic()"));
+            assertTrue("the message must name the stage above", e.getMessage().contains("forEach"));
+            assertTrue("and offer the way out", e.getMessage().contains("Drop checkpointed()"));
+        }
+    }
+
+    /** Below a deterministic one it is fine: the re-derived prefix is byte-identical. */
+    @Test
+    public void aCheckpointBelowADeterministicMaterialisingStageIsAllowed() throws Exception {
+        withDurableState(() -> {
+            StreamPipeline p = pipeline("det-above");
+            p.setSourceProvided(true);
+            p.setWorkspaceRoot(Files.createTempDirectory("mft-det-above").toString());
+            p.addOperator(new Mocks.DeterministicMaterialising("convert"), true);
+            p.addOperator(new Mocks.CheckpointingSink("sink"), true);
+            p.validate();
+        });
+    }
+
+    /**
+     * Every stage above is scanned, not just the nearest.
+     *
+     * <p>Non-determinism propagates through a deterministic stage, because a deterministic stage fed
+     * different input produces different output.
+     */
+    @Test
+    public void theScanReachesPastANearerDeterministicStage() {
+        StreamPipeline p = pipeline("propagates");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.Checkpointing("forEach"), true);              // non-deterministic
+        p.addOperator(new Mocks.DeterministicMaterialising("convert"), true); // deterministic
+        p.addOperator(new Mocks.CheckpointingSink("sink"), true);
+        try {
+            p.validate();
+            fail("non-determinism must propagate through the deterministic stage");
+        } catch (StreamException e) {
+            assertTrue("the offending stage is the far one, not the near one",
+                    e.getMessage().contains("forEach"));
+        }
+    }
+
+    /** A stage with no position of its own is unaffected — there is nothing to invalidate. */
+    @Test
+    public void aMaterialisingOnlyStageBelowANonDeterministicOneIsAllowed() throws Exception {
+        withDurableState(() -> {
+            StreamPipeline p = pipeline("no-position");
+            p.setSourceProvided(true);
+            p.setWorkspaceRoot(Files.createTempDirectory("mft-no-position").toString());
+            p.addOperator(new Mocks.Checkpointing("forEach"), true);
+            p.addOperator(new Mocks.CapturingWorkspace("spill"), true);  // materialises, no checkpoint
+            p.addOperator(new Mocks.Sink("sink"), true);
+            p.validate();
+        });
+    }
+
+    /** Runs a body with a checkpoint store registered, so R15 is satisfied and R18 is what is tested. */
+    private static void withDurableState(ThrowingRunnable body) throws Exception {
+        CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
+            @Override
+            public Checkpoint lastComplete() {
+                return null;
+            }
+
+            @Override
+            public void append(Checkpoint checkpoint) {
+            }
+
+            @Override
+            public void clear() {
+            }
+        });
+        try {
+            body.run();
+        } finally {
+            CheckpointStores.register(null);
+        }
+    }
+
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
+    /** A sink's artifact could never be read, so declaring materialises() is refused. */
+    @Test
+    public void aMaterialisingSinkIsRefused() {
+        StreamPipeline p = pipeline("mat-sink");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.MaterialisingSink(), true);
+        try {
+            p.validate();
+            fail("expected a materialising sink to be refused");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("nothing can ever read the artifact"));
+            assertTrue("and say what to do instead", e.getMessage().contains("a second sink"));
+        }
+    }
+
     private static JobContext jobWithId(String id) {
         return new JobContext() {
             @Override

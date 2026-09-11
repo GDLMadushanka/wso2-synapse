@@ -43,9 +43,11 @@ package org.apache.synapse.stream;
  * @param invokerName        the invoking artifact's name, or {@code null} when nothing identified it
  * @param resumable          whether this run could be resumed, as computed for this origin
  * @param workspacePath      the run's directory, or {@code null} when it has none
- * @param sourceId           stable identity of the origin, or {@code null} when unknown
- * @param sourceSize         source byte length, or {@link StreamSeed#UNKNOWN}
- * @param sourceLastModified source modification time in epoch millis, or {@link StreamSeed#UNKNOWN}
+ * @param sourceId           the seed's opaque {@link StreamSeed#identity()}, or {@code null} when the
+ *                           provider had none — in which case nothing can resume this run
+ * @param sourceSize         source byte length, or {@link StreamSeed#UNKNOWN}. Telemetry only
+ * @param sourceLastModified source modification time in epoch millis, or {@link StreamSeed#UNKNOWN}.
+ *                           Telemetry only
  */
 public record JobRun(String runId, String pipelineName, String invokerType, String invokerName,
                      boolean resumable, String workspacePath, String sourceId, long sourceSize,

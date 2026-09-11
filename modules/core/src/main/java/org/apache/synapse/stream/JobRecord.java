@@ -30,9 +30,13 @@ package org.apache.synapse.stream;
  * @param runId              the run this describes
  * @param status             the status the previous attempt ended in
  * @param attempt            how many attempts had been made before this one
- * @param sourceId           the identity recorded then, or {@code null} if none was
- * @param sourceSize         the size recorded then, or {@link StreamSeed#UNKNOWN}
- * @param sourceLastModified the modification time recorded then, or {@link StreamSeed#UNKNOWN}
+ * @param sourceId           the seed's opaque {@link StreamSeed#identity()} as recorded then, or
+ *                           {@code null} if none was. Compared for <b>equality only</b> — the framework
+ *                           has no opinion about what is inside it (ADR-0033)
+ * @param sourceSize         the size recorded then, or {@link StreamSeed#UNKNOWN}. Telemetry: it appears
+ *                           in diagnostics and feeds no decision about whether the source changed
+ * @param sourceLastModified the modification time recorded then, or {@link StreamSeed#UNKNOWN}.
+ *                           Telemetry, as {@code sourceSize} is
  */
 public record JobRecord(String runId, String status, int attempt, String sourceId, long sourceSize,
                         long sourceLastModified) {

@@ -91,9 +91,53 @@ public class StreamContractsTest {
                 StreamOrigin.REOPENABLE);
 
         assertEquals(in, seed.stream());
-        assertEquals("sftp://host/in/data.csv", seed.sourceId());
+        assertEquals("sftp://host/in/data.csv", seed.identity());
+        assertTrue(seed.hasIdentity());
         assertTrue(seed.hasSize());
         assertTrue(seed.hasLastModified());
+    }
+
+    /**
+     * A provider with nothing to recognise its bytes by says so, and the run becomes scratch.
+     *
+     * <p>The identity used to be refused as blank-or-null, which forced every provider to invent one.
+     * An HTTP multipart body has none to invent, and a made-up identity is the dangerous answer: it
+     * collides with the next made-up one and two unrelated runs share a workspace.
+     */
+    @Test
+    public void aSeedMayHaveNoIdentityAtAll() {
+        StreamSeed anonymous = new StreamSeed(new ByteArrayInputStream(new byte[0]), null,
+                StreamSeed.UNKNOWN, StreamSeed.UNKNOWN, StreamOrigin.ONE_SHOT);
+        assertFalse(anonymous.hasIdentity());
+        assertNull(anonymous.identity());
+    }
+
+    /** Blank is the same as absent: an empty identity carries no more information than none. */
+    @Test
+    public void aBlankIdentityNormalisesToAbsent() {
+        for (String blank : new String[] {"", "   ", "\t\n"}) {
+            StreamSeed seed = new StreamSeed(new ByteArrayInputStream(new byte[0]), blank,
+                    StreamSeed.UNKNOWN, StreamSeed.UNKNOWN, StreamOrigin.REOPENABLE);
+            assertFalse("'" + blank + "' must not name a run", seed.hasIdentity());
+            assertNull(seed.identity());
+        }
+    }
+
+    /**
+     * An identity too long to record is refused, not truncated.
+     *
+     * <p>Truncating would leave something that still looks like an identity, so two sources agreeing
+     * for the first kilobyte would silently become one run.
+     */
+    @Test
+    public void anIdentityTooLongToRecordIsRefused() {
+        String tooLong = "x".repeat(StreamSeed.MAX_IDENTITY_CHARS + 1);
+        assertRejected(() -> new StreamSeed(new ByteArrayInputStream(new byte[0]), tooLong,
+                StreamSeed.UNKNOWN, StreamSeed.UNKNOWN, StreamOrigin.REOPENABLE), "hash it down");
+
+        String atLimit = "x".repeat(StreamSeed.MAX_IDENTITY_CHARS);
+        assertEquals(atLimit, new StreamSeed(new ByteArrayInputStream(new byte[0]), atLimit,
+                StreamSeed.UNKNOWN, StreamSeed.UNKNOWN, StreamOrigin.REOPENABLE).identity());
     }
 
     @Test
@@ -106,12 +150,11 @@ public class StreamContractsTest {
     }
 
     @Test
-    public void seedRequiresAStreamAndASourceId() {
+    public void seedRequiresAStreamAndNothingElse() {
         assertRejected(() -> new StreamSeed(null, "id", 1L, 1L, StreamOrigin.REOPENABLE), "stream");
-        assertRejected(() -> new StreamSeed(new ByteArrayInputStream(new byte[0]), null, 1L, 1L, StreamOrigin.REOPENABLE),
-                "sourceId");
-        assertRejected(() -> new StreamSeed(new ByteArrayInputStream(new byte[0]), " ", 1L, 1L, StreamOrigin.REOPENABLE),
-                "sourceId");
+        assertRejected(() -> new StreamSeed(new ByteArrayInputStream(new byte[0]), "id", 1L, 1L, null),
+                "origin");
+        // The identity is deliberately NOT required -- see aSeedMayHaveNoIdentityAtAll.
     }
 
     // ---------- JobContext ----------

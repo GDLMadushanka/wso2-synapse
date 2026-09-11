@@ -37,6 +37,7 @@ import org.apache.synapse.stream.JobRun;
 import org.apache.synapse.stream.JobStore;
 import org.apache.synapse.stream.JobStores;
 import org.apache.synapse.stream.ResourceScope;
+import org.apache.synapse.stream.StageArtifact;
 import org.apache.synapse.stream.SourceIdentityPolicy;
 import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamOperator;
@@ -165,6 +166,19 @@ public class StreamPipeline implements ManagedLifecycle {
      * {@link SourceIdentityPolicy#WARN}, which never resumes across a change but never blocks a run.
      */
     private SourceIdentityPolicy sourceIdentity = SourceIdentityPolicy.WARN;
+
+    /**
+     * Whether the deployer permits this pipeline to resume. Default {@code true} — meaning "if the run
+     * qualifies", never "make it qualify".
+     *
+     * <p><b>One-directional by design.</b> Setting it false can only make a run <i>less</i> durable
+     * than its origin permits, which is a choice a deployer is entitled to make: {@code maxReprocessed}
+     * bottoms out at one unit, and a sink that is not idempotent at all needs zero replay. There is
+     * deliberately no way to set it true and mean it, because no attribute can make a {@code ONE_SHOT}
+     * source re-readable — that was ADR-0018's mistake, which ADR-0019 removed, and this must not
+     * reintroduce it. See ADR-0033.
+     */
+    private boolean resume = true;
 
     private SynapseEnvironment environment;
 
@@ -324,6 +338,30 @@ public class StreamPipeline implements ManagedLifecycle {
             // A terminal stage is exempt because nothing downstream can be missing anything: a sink is
             // always terminal, which is why the remote-authoritative sink (checkpointed, no artifact)
             // stays legal.
+            // ADR-0034. A position counts records of the stage above it. If that stage materialises
+            // and is not deterministic, a partial resume re-derives its unpersisted tail and may
+            // re-derive it DIFFERENTLY -- so this stage's position would skip records of different
+            // bytes. Silent corruption, and the exact failure deterministic()'s javadoc warns about.
+            //
+            // Every stage above is scanned, not just the nearest: non-determinism propagates through
+            // a deterministic stage, because a deterministic stage fed different input produces
+            // different output.
+            if (op.checkpointed()) {
+                for (int j = 0; j < i; j++) {
+                    StreamOperator above = operators.get(j);
+                    if (above.materialises() && !above.deterministic()) {
+                        throw new StreamException(where + " declares checkpointed(), but operator "
+                                + j + " ('" + stageNameAt(j, above) + "') above it materialises"
+                                + " without declaring deterministic(). A failure re-derives that"
+                                + " stage's unpersisted tail, which may differ, so this stage's"
+                                + " recorded position would skip records of different bytes --"
+                                + " silently. Drop checkpointed() here and declare materialises()"
+                                + " instead, which re-runs this segment after a failure but cannot"
+                                + " corrupt it; or make the stage above deterministic if it truly is");
+                    }
+                }
+            }
+
             if (op.checkpointed() && !op.materialises() && i != last) {
                 throw new StreamException(where + " declares checkpointed() without materialises() but"
                         + " is not the last stage. Its position would survive a failure that discarded"
@@ -332,6 +370,18 @@ public class StreamPipeline implements ManagedLifecycle {
                         + " afterwards. Declare materialises() as well, which ends a segment here and"
                         + " lets the stages after it resume from a complete artifact, or move the"
                         + " checkpoint to the last stage");
+            }
+
+            // G2. A materialising stage writes an artifact so the NEXT segment can read it. A sink
+            // has no next, so the artifact is written, sealed and never opened -- disk equal to the
+            // whole output, spent on nothing. Refused rather than warned: the flag reads as durability
+            // and buys none, and a deployer who wanted a durable copy wants a second sink, not this.
+            if (op instanceof StreamSink && op.materialises()) {
+                throw new StreamException(where + " is a StreamSink and declares materialises(), but"
+                        + " a sink is always last, so nothing can ever read the artifact it would"
+                        + " write. It would cost disk equal to the whole output and be deleted"
+                        + " unread. Drop materialises(); a sink that also needs a durable copy is a"
+                        + " second sink, not a flag");
             }
 
             if (op instanceof StreamSink) {
@@ -452,8 +502,21 @@ public class StreamPipeline implements ManagedLifecycle {
      * @param origin where this run's bytes come from
      * @return {@code true} if this run should keep checkpoints and needs a real job id
      */
+    /**
+     * Whether a run named {@code runId}, over a source with this {@code origin}, could resume.
+     *
+     * <p>Four conditions, and every one is necessary:
+     * <ul>
+     *   <li>something durable to resume <i>into</i> — a checkpoint or a materialised artifact;</li>
+     *   <li>a {@code REOPENABLE} origin, or the bytes cannot be read a second time;</li>
+     *   <li>a stable run id, which for a seed means the provider gave it an identity — a source that
+     *       cannot be <i>recognised</i> cannot be resumed, however re-readable it is;</li>
+     *   <li>the deployer not having declined it with {@code resume="false"}.</li>
+     * </ul>
+     */
     public boolean resumable(StreamOrigin origin, String runId, boolean runIdStable) {
-        return hasDurableState() && origin == StreamOrigin.REOPENABLE && runIdStable && runId != null;
+        return hasDurableState() && origin == StreamOrigin.REOPENABLE && runIdStable && runId != null
+                && resume;
     }
 
     /**
@@ -471,12 +534,13 @@ public class StreamPipeline implements ManagedLifecycle {
      * <ol>
      *   <li><b>The caller's job id</b>, when there is one. Every queued transfer has one before it
      *       runs, and a retry deliberately keeps it, which is what makes resume work.</li>
-     *   <li><b>The seed's identity</b>, when the caller supplied a stream instead. A file inbound
-     *       endpoint knows the URI, size and modification time, so the run can be content-addressed
-     *       and re-detecting the same file lands on the same workspace. This needs no I/O — the fields
-     *       are already on the seed.</li>
-     *   <li><b>A fresh id</b> otherwise. Nothing stable was available, so nothing will resume: the run
-     *       is scratch and its workspace is reclaimed when it ends.</li>
+     *   <li><b>The seed's identity</b>, when the caller supplied a stream instead and said what it is.
+     *       Re-presenting the same source lands on the same workspace, so a re-poll continues rather
+     *       than starting over. This needs no I/O — the provider computed the identity when it built
+     *       the seed.</li>
+     *   <li><b>A fresh id</b> otherwise — no seed, no identity on it, or a {@code ONE_SHOT} origin.
+     *       Nothing stable was available, so nothing will resume: the run is scratch and its workspace
+     *       is reclaimed when it ends.</li>
      * </ol>
      *
      * <p>The pipeline name is folded into case 2 so that two pipelines processing the same file
@@ -495,15 +559,41 @@ public class StreamPipeline implements ManagedLifecycle {
             requirePathSegment("job id", callerJobId);
             return new RunId(callerJobId, true);
         }
-        if (seed != null && origin == StreamOrigin.REOPENABLE) {
-            // Content-addressed: same pipeline over the same bytes resumes into the same workspace, and
-            // a changed source lands somewhere else rather than resuming into stale artifacts.
-            String material = name + '\0' + seed.sourceId() + '\0' + seed.size()
-                    + '\0' + seed.lastModified();
+        if (seed != null && seed.hasIdentity() && origin == StreamOrigin.REOPENABLE) {
+            // Content-addressed: the same pipeline over the same source resumes into the same
+            // workspace, and a different source lands somewhere else rather than resuming into stale
+            // artifacts.
+            //
+            // Only the identity is hashed. This used to fold in the seed's size and lastModified as
+            // well, which was a filesystem's notion of sameness promoted to a universal rule: an email
+            // attachment has no modification time, so it hashed UNKNOWN and diluted an identity that
+            // was already stronger than anything the composition could express. Deciding what
+            // distinguishes two sources is the provider's job -- ADR-0033.
+            String material = name + '\0' + seed.identity();
             return new RunId("src-" + Integer.toHexString(material.hashCode())
                     + '-' + Long.toHexString(fnv1a(material)), true);
         }
         return new RunId("run-" + UUID.randomUUID(), false);
+    }
+
+    /**
+     * A failure message with the root cause appended, for the job record and the fault sequence.
+     *
+     * <p>{@code getMessage()} alone reads "stream pipeline 'x' failed at stage 'rows'", which says
+     * where and not why. The why is always one or more causes down — a sequence that is not deployed,
+     * a malformed record, a rejected write — and a caller formatting a response from
+     * {@code ERROR_MESSAGE} sees only the outer layer.
+     */
+    private static String withRootCause(Throwable failure) {
+        Throwable root = failure;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        if (root == failure) {
+            return failure.getMessage();
+        }
+        return failure.getMessage() + " -- caused by " + root.getClass().getSimpleName() + ": "
+                + root.getMessage();
     }
 
     /** A second, independent hash so a 32-bit collision alone cannot merge two runs' workspaces. */
@@ -517,6 +607,72 @@ public class StreamPipeline implements ManagedLifecycle {
 
     /** A run's workspace name, and whether anything may resume from it. */
     record RunId(String value, boolean stable) {
+    }
+
+    /**
+     * Serves a stage's already-produced output, then its live output — one unbroken stream.
+     *
+     * <p>The prefix is opened on the <b>first read</b>, never during the build, so invariant 1 still
+     * holds: obtaining an artifact does no I/O, and this does none until something pulls. That timing
+     * also gets the ordering right for free — {@code openPrefix()} reconciles and truncates, and it
+     * runs before the operator's own first read, which is where the operator would otherwise have
+     * triggered the same reconciliation.
+     *
+     * <p>The seam is invisible downstream. The recorded artifact length is always the byte offset just
+     * past a whole unit's output, because {@code unitDone} is called after {@code append}, so the
+     * prefix can never end mid-record; and the operator resumes at the input position recorded with
+     * that same length, so the first live byte is exactly the one that followed.
+     *
+     * <p>On a fresh run the prefix is empty and this costs one extra virtual call per read.
+     */
+    private static final class ArtifactPrefixStream extends InputStream {
+
+        private final StageArtifact artifact;
+        private final InputStream live;
+        private InputStream prefix;
+        private boolean prefixDone;
+
+        private ArtifactPrefixStream(StageArtifact artifact, InputStream live) {
+            this.artifact = artifact;
+            this.live = live;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n == -1 ? -1 : one[0] & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (len == 0) {
+                return 0;
+            }
+            if (!prefixDone) {
+                if (prefix == null) {
+                    prefix = artifact.openPrefix();
+                }
+                int n = prefix.read(b, off, len);
+                if (n != -1) {
+                    return n;
+                }
+                prefix.close();
+                prefixDone = true;
+            }
+            return live.read(b, off, len);
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                if (prefix != null && !prefixDone) {
+                    prefix.close();
+                }
+            } finally {
+                live.close();
+            }
+        }
     }
 
     /** What invoked a run: a kind, and the invoking artifact's name when one could be identified. */
@@ -672,7 +828,7 @@ public class StreamPipeline implements ManagedLifecycle {
         Invoker invoker = resolveInvoker(msg, jobCtx);
         JobRecord prior = store.start(new JobRun(runId.value(), name, invoker.type(), invoker.name(),
                 resumable, runDir == null ? null : runDir.toString(),
-                seed == null ? null : seed.sourceId(),
+                seed == null ? null : seed.identity(),
                 seed == null ? StreamSeed.UNKNOWN : seed.size(),
                 seed == null ? StreamSeed.UNKNOWN : seed.lastModified()));
 
@@ -766,9 +922,35 @@ public class StreamPipeline implements ManagedLifecycle {
                                     + " wrapper or per-stage accounting is wrong").withStage(stage);
                         }
                     }
+                } catch (StreamException e) {
+                    // Attributed here, because only this loop knows which stage it was building. The
+                    // outer handler cannot: an unattributed StreamException reaching it is assumed to
+                    // have come from the sink, which is right for the pull phase and wrong for this
+                    // one -- a forEach refusing its configuration was reported against the file sink
+                    // three stages away, which is worse than no attribution at all.
+                    throw e.getStage() == null ? e.withStage(stage) : e;
+                } catch (RuntimeException e) {
+                    throw new StreamException("operator '" + stage + "' failed while being built", e,
+                            false).withStage(stage);
                 } finally {
                     if (bound) {
                         resolution.release(msg);
+                    }
+                }
+
+                // A resumed materialising stage must hand its downstream the WHOLE output stream it
+                // produced before, not only the part it is about to re-derive. The downstream counts
+                // records from 1 and skips its own recorded position; given only the tail, that count
+                // lands past the end or over different records and rows vanish with the run reporting
+                // success.
+                //
+                // Done here rather than in the operator because every materialising transform needs
+                // it and forgetting it is silent -- the same argument that put fsync-then-advance
+                // inside unitDone. No operator calls openPrefix().
+                if (op.materialises() && !(op instanceof StreamSink)) {
+                    StageArtifact produced = ctx.canonicalArtifact();
+                    if (produced != null) {
+                        current = new ArtifactPrefixStream(produced, current);
                     }
                 }
 
@@ -845,6 +1027,10 @@ public class StreamPipeline implements ManagedLifecycle {
             // failed, then let it propagate UNWRAPPED — turning an OutOfMemoryError into a
             // StreamException would invite a caller to retry it. `pulled` is false, so the finally
             // aborts and nothing is published.
+            // Logged here, not left to the caller. An Error propagates unwrapped, so nothing
+            // downstream necessarily reports it either.
+            log.error(LoggingUtils.getFormattedLog(SynapseConstants.STREAM_PIPELINE_TYPE, name,
+                    "run '" + runId.value() + "' failed with an unrecoverable error"), t);
             recorder.recordFailure(sinkName(), "STREAM_PIPELINE_ERROR", t.toString(), false);
             throw t;
         } finally {
@@ -872,8 +1058,16 @@ public class StreamPipeline implements ManagedLifecycle {
         }
 
         if (primary != null) {
-            recorder.recordFailure(primary.getStage(), "STREAM_PIPELINE_FAILED", primary.getMessage(),
-                    primary.isRetryable());
+            // Logged here rather than left to whoever catches it, and this is the whole reason:
+            // execute() throws, the mediator rethrows as a SynapseException, and a fault sequence
+            // that formats a response discards the cause chain entirely. The message a caller sees
+            // names the stage; the reason the stage failed is only ever in the cause. A failed
+            // transfer with nothing in the log is not diagnosable.
+            log.error(LoggingUtils.getFormattedLog(SynapseConstants.STREAM_PIPELINE_TYPE, name,
+                    "run '" + runId.value() + "' failed at stage '" + primary.getStage()
+                            + "' (retryable=" + primary.isRetryable() + ")"), primary);
+            recorder.recordFailure(primary.getStage(), "STREAM_PIPELINE_FAILED",
+                    withRootCause(primary), primary.isRetryable());
             throw primary;
         }
         recorder.succeeded();
@@ -900,7 +1094,7 @@ public class StreamPipeline implements ManagedLifecycle {
         String detail = "run '" + runId.value() + "' of stream pipeline '" + name + "' previously read "
                 + describeSource(prior.sourceId(), prior.sourceSize(), prior.sourceLastModified())
                 + " but this attempt found "
-                + describeSource(seed.sourceId(), seed.size(), seed.lastModified());
+                + describeSource(seed.identity(), seed.size(), seed.lastModified());
 
         if (sourceIdentity == SourceIdentityPolicy.STRICT) {
             throw new StreamException(detail + "; sourceIdentity=\"strict\" refuses to continue", false);
@@ -948,12 +1142,27 @@ public class StreamPipeline implements ManagedLifecycle {
     }
 
     /** Identity is all three fields: a same-sized rewrite at a new mtime is still a different source. */
+    /**
+     * Whether this attempt is reading what the previous one read.
+     *
+     * <p>Equality of two opaque strings, and nothing more. This used to compare the identity, the size
+     * and the modification time separately, which made the framework hold a second identity policy
+     * alongside the one in {@link #resolveRunId} — and a contradictory one. If a provider folds size
+     * and mtime into its identity, comparing them again is unreachable; if it deliberately leaves them
+     * out, comparing them overrides a decision the provider already made. Either way it was wrong, so
+     * there is now exactly one place that decides what "the same source" means, and it is not here.
+     */
     private static boolean sameSource(JobRecord prior, StreamSeed seed) {
-        return Objects.equals(prior.sourceId(), seed.sourceId())
-                && prior.sourceSize() == seed.size()
-                && prior.sourceLastModified() == seed.lastModified();
+        return Objects.equals(prior.sourceId(), seed.identity());
     }
 
+    /**
+     * A source for a human, in a message.
+     *
+     * <p>Size and modification time appear here and <b>only</b> here. With an opaque identity the
+     * framework can no longer say <i>what</i> about a source changed, only that it did, so reporting
+     * them alongside keeps the diagnostic actionable. Reported, never decided upon.
+     */
     private static String describeSource(String id, long size, long lastModified) {
         return "'" + id + "' (size=" + (size == StreamSeed.UNKNOWN ? "unknown" : size)
                 + ", lastModified=" + (lastModified == StreamSeed.UNKNOWN ? "unknown" : lastModified)
@@ -985,19 +1194,32 @@ public class StreamPipeline implements ManagedLifecycle {
      * over a directory that could not be removed would turn a successful transfer into a failed one.
      */
     private void reclaimScratchWorkspace(Path runDir, boolean resumable, String runId) {
-        if (runDir == null || resumable) {
+        if (resumable) {
             return;
         }
         try {
-            discardWorkspace(runDir);
+            // Positions as well as files, and note this runs even when runDir is null. Checkpoints
+            // live in the database, so discarding the directory does not touch them -- and a stage
+            // that is checkpointed() without materialises() has no artifact for L <= A to catch a
+            // stale position against. Exactly the reasoning already recorded in clearCheckpoints,
+            // arrived at there for the source-identity guard.
+            //
+            // Reachable only since resume="false", which is the one way a run can be non-resumable
+            // and still land on the same identity-derived run id next time; before it, every
+            // non-resumable run got a fresh UUID and could never collide with its own leftovers.
+            clearCheckpoints(runId);
+            if (runDir != null) {
+                discardWorkspace(runDir);
+            }
             if (log.isDebugEnabled()) {
-                log.debug("stream pipeline '" + name + "' reclaimed the scratch workspace of run '"
+                log.debug("stream pipeline '" + name + "' reclaimed the scratch state of run '"
                         + runId + "'; nothing could have resumed from it");
             }
         } catch (StreamException | RuntimeException e) {
-            log.warn("stream pipeline '" + name + "' could not reclaim the scratch workspace of run '"
-                    + runId + "' at '" + runDir + "'; the transfer is unaffected but the directory is"
-                    + " left behind and nothing will collect it", e);
+            log.warn("stream pipeline '" + name + "' could not reclaim the scratch state of run '"
+                    + runId + "' at '" + runDir + "'. The transfer is unaffected, but a stale position"
+                    + " or directory is left behind: a later run of the same source could resume from"
+                    + " state this run meant to discard", e);
         }
     }
 
@@ -1464,11 +1686,13 @@ public class StreamPipeline implements ManagedLifecycle {
             return;
         }
         operators.clear();
-        for (OperatorEntry.Resolution resolution : resolveForRun()) {
+        List<OperatorEntry.Resolution> resolutions = resolveForRun();
+        for (OperatorEntry.Resolution resolution : resolutions) {
             operators.add(resolution.operator());
         }
         try {
             validate();
+            checkStageConfiguration(resolutions);
         } catch (StreamException e) {
             throw new SynapseException("stream pipeline '" + name + "' is not valid: "
                     + e.getMessage(), e);
@@ -1476,6 +1700,40 @@ public class StreamPipeline implements ManagedLifecycle {
         validated = true;
         auditInfo("Successfully deployed Stream Pipeline: " + name + " with " + operators.size()
                 + " operator(s)");
+    }
+
+    /**
+     * Asks every stage whether the configuration it was given could work, before any file is touched.
+     *
+     * <h2>Why at deployment, and why it matters more than it looks</h2>
+     * A connector operation reads its parameters from the bound message, so nothing would otherwise
+     * look at them until a run started — and a typo would then surface as a failed transfer over a
+     * real customer file. The cost is not just the wasted run. Once bytes are moving, the framework
+     * <b>cannot tell a bad declaration from a bad file</b>: "this column will not parse as an integer"
+     * has two explanations and no way to choose, so any action it takes — delete the file, retry
+     * forever — is wrong half the time.
+     *
+     * <p>Deciding it here removes the question instead of answering it badly. A structural mistake is
+     * decidable from the configuration alone, with no file in hand, so the artifact is faulty and
+     * nothing runs.
+     *
+     * <p>Only literal parameters are offered, since an expression needs a message to evaluate. What
+     * remains genuinely undecidable — a column correctly declared for a different file — stays
+     * undecidable, and is the deployer's {@code ActionAfterFailure} to dispose of.
+     */
+    private void checkStageConfiguration(List<OperatorEntry.Resolution> resolutions)
+            throws StreamException {
+        for (int i = 0; i < resolutions.size(); i++) {
+            OperatorEntry.Resolution resolution = resolutions.get(i);
+            StreamOperator op = resolution.operator();
+            try {
+                op.validateConfiguration(resolution.literalParameters());
+            } catch (StreamException e) {
+                throw new StreamException("operator " + i + " ('" + stageNameAt(i, op)
+                        + "') of stream pipeline '" + name + "' is misconfigured: " + e.getMessage(),
+                        e, false).withStage(stageNameAt(i, op));
+            }
+        }
     }
 
     /** Whether any stage still has to be reached through a connector template. */
@@ -1546,6 +1804,16 @@ public class StreamPipeline implements ManagedLifecycle {
     /** What to do when a retry finds a different source than the attempt it resumes. */
     public SourceIdentityPolicy getSourceIdentity() {
         return sourceIdentity;
+    }
+
+    /** Whether the deployer permits resume. See the field's javadoc on why there is no way to force it. */
+    public boolean isResume() {
+        return resume;
+    }
+
+    /** @param resume {@code false} to make every run of this pipeline scratch */
+    public void setResume(boolean resume) {
+        this.resume = resume;
     }
 
     public void setSourceIdentity(SourceIdentityPolicy policy) {

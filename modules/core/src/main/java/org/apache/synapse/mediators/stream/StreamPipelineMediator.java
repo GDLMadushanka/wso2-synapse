@@ -81,6 +81,8 @@ public class StreamPipelineMediator extends AbstractMediator {
         try {
             pipeline.execute(synCtx, job, seed);
         } catch (StreamException e) {
+            // The pipeline has already logged this with its full cause chain. Recorded on the
+            // message so a fault sequence can report the stage without re-deriving it.
             // Record what a fault sequence needs, then rethrow so the standard machinery runs it and
             // populates ERROR_CODE / ERROR_MESSAGE alongside these.
             synCtx.setProperty(FAILED_STAGE_PROPERTY, e.getStage());

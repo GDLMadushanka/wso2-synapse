@@ -309,12 +309,24 @@ public class DefaultStreamContext implements StreamContext {
 
         StageArtifact artifact = new DefaultStageArtifact(stageName, workspace, name,
                 unit == null ? null : checkpointStore, unit, formatVersion, maxReprocessed, resources,
-                this::resumedFromArtifact, !CANONICAL_ARTIFACT.equals(name));
+                this::resumedFromArtifact, CANONICAL_ARTIFACT.equals(name));
         artifacts.put(name, new Held(artifact, unit));
         return artifact;
     }
 
     /** An artifact and how it was obtained, so an inconsistent second request is caught. */
+    /**
+     * The canonical artifact, if this stage obtained one, else {@code null}.
+     *
+     * <p>For the pipeline, which concatenates the already-produced prefix ahead of a resumed stage's
+     * output. Only the canonical name qualifies: a stage's own working files mean nothing about its
+     * output, and prepending one would corrupt the stream — see {@link StageArtifact#openPrefix()}.
+     */
+    StageArtifact canonicalArtifact() {
+        Held held = artifacts.get(CANONICAL_ARTIFACT);
+        return held == null ? null : held.artifact();
+    }
+
     private record Held(StageArtifact artifact, CheckpointUnit unit) {
     }
 }

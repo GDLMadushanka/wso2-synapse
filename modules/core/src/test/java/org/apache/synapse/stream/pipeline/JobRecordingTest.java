@@ -78,6 +78,7 @@ public class JobRecordingTest {
 
         final List<JobRun> started = new ArrayList<>();
         final List<String> events = new ArrayList<>();
+        final List<String> failureMessages = new ArrayList<>();
         JobRecord prior;
         RuntimeException failOnStart;
         RuntimeException failOnEverythingElse;
@@ -119,6 +120,7 @@ public class JobRecordingTest {
         public void failed(String runId, String stage, String code, String message, boolean retry) {
             raise();
             events.add("failed:" + stage + ":" + code);
+            failureMessages.add(message);
         }
 
         private void raise() {
@@ -157,6 +159,38 @@ public class JobRecordingTest {
                 store.events.contains("skipped:0:src"));
         assertFalse("and not reported as if it had done work",
                 store.events.contains("stage:0:src"));
+    }
+
+    /**
+     * A failed run records <b>why</b>, not just where.
+     *
+     * <p>{@code getMessage()} alone says "failed at stage 'rows'", which names the stage and not the
+     * reason — the reason is always a cause or two down. A caller formatting a response from
+     * {@code ERROR_MESSAGE} would otherwise report a failure with no diagnosable content, which is
+     * exactly what happened on the first real transfer to fail.
+     */
+    @Test
+    public void aFailureRecordsItsRootCause() throws Exception {
+        Recording store = new Recording();
+        store.install();
+
+        StreamPipeline p = pipeline("root-cause");
+        p.addOperator(new Mocks.Source("src", DATA), true);
+        p.addOperator(new Mocks.FailingTransform("mid"), true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        try {
+            p.execute(null, jobId("job-cause"));
+            fail("expected the transform's failure to propagate");
+        } catch (StreamException expected) {
+            assertNotNull(expected.getStage());
+        }
+
+        assertFalse("the failure must be recorded at all", store.failureMessages.isEmpty());
+        String recorded = store.failureMessages.get(0);
+        assertTrue("the recorded reason must carry the cause, not just the stage: " + recorded,
+                recorded != null && recorded.contains("caused by"));
     }
 
     // ------------------------------------------------------------------ every run is recorded
@@ -598,7 +632,7 @@ public class JobRecordingTest {
     @Test
     public void warnDiscardsTheWorkspaceOfAChangedSource() throws Exception {
         Recording store = new Recording();
-        store.prior = new JobRecord("job-2", "FAILED", 1, "file:/in/a.csv", 16L, 1234L);
+        store.prior = new JobRecord("job-2", "FAILED", 1, "file:/in/a.csv|16|1234", 16L, 1234L);
         store.install();
 
         Path root = Files.createTempDirectory("mft-guard-warn");
@@ -611,8 +645,8 @@ public class JobRecordingTest {
         Path stale = stage.resolve("artifact.out");
         Files.writeString(stale, "bytes of a file that is no longer there");
 
-        // Same job id, different file underneath it — the retry case the guard exists for.
-        p.execute(null, jobId("job-2"), seed("file:/in/a.csv", 99L, 5678L));
+        // Same job id, a different identity underneath it — the retry case the guard exists for.
+        p.execute(null, jobId("job-2"), seed("file:/in/a.csv|99|5678", 99L, 5678L));
 
         assertFalse("resuming into another source's artifact is the corruption this prevents",
                 Files.exists(stale));
@@ -622,7 +656,9 @@ public class JobRecordingTest {
     @Test
     public void strictRefusesAChangedSource() throws Exception {
         Recording store = new Recording();
-        store.prior = new JobRecord("job-3", "FAILED", 1, "file:/in/a.csv", 16L, 1234L);
+        // The recorded identity is what a file provider composes: the URI plus what tells a
+        // replacement apart from the original.
+        store.prior = new JobRecord("job-3", "FAILED", 1, "file:/in/a.csv|16|1234", 16L, 1234L);
         store.install();
 
         Path root = Files.createTempDirectory("mft-guard-strict");
@@ -631,7 +667,7 @@ public class JobRecordingTest {
         p.validate();
 
         try {
-            p.execute(null, jobId("job-3"), seed("file:/in/a.csv", 99L, 5678L));
+            p.execute(null, jobId("job-3"), seed("file:/in/a.csv|99|5678", 99L, 5678L));
             fail("expected strict to refuse a changed source");
         } catch (StreamException e) {
             assertTrue(e.getMessage(), e.getMessage().contains("previously read"));

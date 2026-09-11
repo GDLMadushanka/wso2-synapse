@@ -30,6 +30,7 @@ import org.apache.synapse.stream.StreamCommit;
 import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.FilterInputStream;
 import java.io.InputStream;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -103,10 +104,21 @@ public class DefaultStageArtifact implements StageArtifact {
     private boolean granularityWarned;
 
     /**
-     * Whether {@link #seal()} is allowed. False for the canonical artifact, whose publish decision
-     * belongs to the run's outcome and nobody else — see invariant 5.
+     * Whether this is the stage's canonical artifact rather than a named working file. Two behaviours
+     * turn on it, and they point in opposite directions:
+     *
+     * <ul>
+     *   <li>Only the canonical artifact signals that the <b>stage</b> short-circuited, because only it
+     *       stands for the stage's whole output. Opening {@code run-3} of a merge sort says nothing
+     *       about whether the stage is done.</li>
+     *   <li>Only a named file may be {@link #seal()}ed, because publishing the canonical artifact is
+     *       the run's outcome to decide — invariant 5.</li>
+     * </ul>
      */
-    private final boolean sealable;
+    private final boolean canonical;
+
+    /** This artifact's file name, which also distinguishes it in the run's resource scope. */
+    private final String artifactName;
 
     /** Set by {@link #seal()}: the file is published, so run-end commit and abort must both stand off. */
     private boolean sealed;
@@ -114,7 +126,7 @@ public class DefaultStageArtifact implements StageArtifact {
     public DefaultStageArtifact(String stageName, Path stageDir, String artifactName,
                                 CheckpointStore store, CheckpointUnit unit, String formatVersion,
                                 int maxReprocessed, ResourceScope resources, Runnable resumeSignal,
-                                boolean sealable) {
+                                boolean canonical) {
         this.stageName = stageName;
         // Null when no workspace is configured, which is legal for a stage that keeps a position and
         // writes nothing. Appending then fails with a message naming the cause; checkpointing does not.
@@ -126,7 +138,8 @@ public class DefaultStageArtifact implements StageArtifact {
         this.maxReprocessed = Math.max(1, maxReprocessed);
         this.resources = resources;
         this.resumeSignal = resumeSignal;
-        this.sealable = sealable;
+        this.canonical = canonical;
+        this.artifactName = artifactName;
     }
 
     // ---------------------------------------------------------------- resume
@@ -144,11 +157,20 @@ public class DefaultStageArtifact implements StageArtifact {
             throw new IllegalStateException("stage '" + stageName + "' has no completed artifact at '"
                     + finalPath + "'; call isComplete() before openComplete()");
         }
-        InputStream in = resources.register(stageName + ":artifact", Files.newInputStream(finalPath));
-        // Signalled here rather than left to the operator. Forgetting it holds every upstream handle
-        // — a remote connection, typically — open and unread for the length of the run, with nothing
-        // to indicate it happened.
-        resumeSignal.run();
+        InputStream in = resources.register(scopeName(), Files.newInputStream(finalPath));
+        // Only for the canonical artifact. It alone stands for the stage's whole output, so finding it
+        // complete means the stage short-circuited and everything built above it is orphaned.
+        //
+        // A NAMED file must not signal this. An external merge sort reads its sealed runs back mid-run,
+        // and if opening run-3 claimed the stage had short-circuited, the pipeline would release the
+        // upstream that phase 1 is still reading from.
+        //
+        // Signalled here rather than left to the operator: forgetting it holds every upstream handle —
+        // a remote connection, typically — open and unread for the length of the run, with nothing to
+        // indicate it happened.
+        if (canonical) {
+            resumeSignal.run();
+        }
         return in;
     }
 
@@ -225,6 +247,63 @@ public class DefaultStageArtifact implements StageArtifact {
     // ---------------------------------------------------------------- writing
 
     @Override
+    public InputStream openPrefix() throws IOException {
+        // Reconciles and truncates before a byte is served -- same start() as resumePosition, so
+        // whichever runs first does the work.
+        start();
+        if (partialPath == null || appendedLength <= 0L || !Files.exists(partialPath)) {
+            return InputStream.nullInputStream();
+        }
+        // Bounded to what was reconciled. The operator appends past this through its own handle while
+        // this stream is being read, and those bytes are the ones it is about to produce again --
+        // serving them here would duplicate them.
+        InputStream file = Files.newInputStream(partialPath, StandardOpenOption.READ);
+        InputStream bounded = new BoundedInputStream(file, appendedLength);
+        resources.register(scopeName(), bounded);
+        return bounded;
+    }
+
+    /** A read-only view of the first {@code limit} bytes of a stream. */
+    private static final class BoundedInputStream extends FilterInputStream {
+
+        private long remaining;
+
+        private BoundedInputStream(InputStream in, long limit) {
+            super(in);
+            this.remaining = limit;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining <= 0L) {
+                return -1;
+            }
+            int b = in.read();
+            if (b != -1) {
+                remaining--;
+            }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (remaining <= 0L) {
+                return -1;
+            }
+            int n = in.read(b, off, (int) Math.min(len, remaining));
+            if (n > 0) {
+                remaining -= n;
+            }
+            return n;
+        }
+
+        @Override
+        public int available() throws IOException {
+            return (int) Math.min(in.available(), remaining);
+        }
+    }
+
+    @Override
     public void append(int b) throws IOException {
         ensureOpen();
         out.write(b);
@@ -259,7 +338,18 @@ public class DefaultStageArtifact implements StageArtifact {
         // Appending, because start() has already truncated to whatever is safe to keep.
         fileOut = new FileOutputStream(partialPath.toFile(), true);
         out = new BufferedOutputStream(fileOut);
-        resources.registerCommitting(stageName + ":artifact", new RenameOnCommit());
+        resources.registerCommitting(scopeName(), new RenameOnCommit());
+    }
+
+    /**
+     * This artifact's name in the run's resource scope.
+     *
+     * <p>Carries the file name, because a stage may hold many: a merge sort's {@code run-0} and
+     * {@code run-1} registered under one name are indistinguishable in the scope and in every log line
+     * about them.
+     */
+    private String scopeName() {
+        return stageName + ":" + artifactName;
     }
 
     // ---------------------------------------------------------------- the ordering contract
@@ -317,7 +407,7 @@ public class DefaultStageArtifact implements StageArtifact {
 
     @Override
     public void seal() throws IOException {
-        if (!sealable) {
+        if (canonical) {
             throw new IllegalStateException("stage '" + stageName + "' tried to seal its canonical"
                     + " artifact. Whether that is published is the run's outcome to decide, not the"
                     + " operator's: publishing a partial artifact would let the next attempt read this"
@@ -361,22 +451,63 @@ public class DefaultStageArtifact implements StageArtifact {
                     StandardCopyOption.REPLACE_EXISTING);
         }
 
+        /**
+         * Closes the partial artifact without publishing it — and <b>without deleting it</b>.
+         *
+         * <h2>Not publishing is the obligation; deleting is not</h2>
+         * Invariant 5 requires that a failed run publish nothing, and the danger it names is precise:
+         * a partial artifact renamed into place, which the next attempt reads as a finished segment.
+         * Declining the rename discharges that in full. The file keeps its {@code .partial} name, so
+         * no later attempt can mistake it for output.
+         *
+         * <p>Deleting it as well used to look like the same thing and is not. It destroyed the only
+         * state that makes the rest of the resume machinery reachable: {@code resumePosition} exists
+         * to reconcile a surviving partial and truncate it, {@code L <= A} exists to check one, and
+         * {@code maxReprocessed} bounds a duplicate window that is only a window if the work below it
+         * survived. With the file gone, {@code L > A} on every retry — so the checkpoint was discarded
+         * and the segment re-ran from zero, whatever any of that was configured to do.
+         *
+         * <h2>Kept only when something can reconcile it</h2>
+         * A partial is worth keeping exactly when a checkpoint records how far it got, because that is
+         * what {@code L <= A} compares against and truncates to. Without one it is unreconcilable:
+         * nothing says which of its bytes were real, the next attempt cannot resume inside it, and its
+         * mere presence could be mistaken for progress. So:
+         * <ul>
+         *   <li><b>checkpointed</b> — kept. This is the resume case, and the whole point.</li>
+         *   <li><b>materialises() only</b> — deleted. The segment re-runs whole; there is no position
+         *       to resume from and a leftover partial could only mislead.</li>
+         *   <li><b>an unsealed working file</b> — deleted. {@code seal()} is the operator's own
+         *       "this one is complete" signal, so an unsealed one is incomplete by definition and has
+         *       no checkpoint to reconcile it.</li>
+         *   <li><b>a sealed working file</b> — kept, as it always was.</li>
+         * </ul>
+         *
+         * <h2>What deletes a kept partial later</h2>
+         * The two places that own the workspace's lifetime, both of which know things this method does
+         * not. {@code reclaimScratchWorkspace} removes the whole run directory when the run could never
+         * have resumed — a {@code ONE_SHOT} source, no identity, or {@code resume="false"} — and it runs
+         * immediately after this, in the same {@code finally}. The source-identity guard discards it
+         * when the source changed underneath the run. Deletion belongs with them because it is a
+         * question about the run, not about one artifact.
+         */
         @Override
         public void abort() throws IOException {
             if (sealed) {
-                // Deliberately kept. A sealed working file surviving a failed run is how the next
-                // attempt resumes instead of redoing the work that produced it.
                 return;
             }
             // Must not throw merely because the write was partial: this runs while a failure is
-            // already being reported, and an exception here competes with the diagnosis.
+            // already being reported, and an exception here competes with the diagnosis. Bytes the
+            // close flushes past the last checkpoint are harmless -- resume truncates to the recorded
+            // length, which is what L <= A is for.
             try {
                 out.close();
             } catch (IOException e) {
                 log.warn("stage '" + stageName + "' failed to close its partial artifact while"
-                        + " aborting; continuing to delete it", e);
+                        + " aborting; continuing", e);
             }
-            Files.deleteIfExists(partialPath);
+            if (store == null) {
+                Files.deleteIfExists(partialPath);
+            }
         }
     }
 }

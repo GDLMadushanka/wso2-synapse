@@ -65,6 +65,7 @@ public class StreamPipelineFactory {
     private static final QName ATT_NAME = new QName("name");
     private static final QName ATT_SOURCE_PROVIDED = new QName("sourceProvided");
     private static final QName ATT_SOURCE_IDENTITY = new QName("sourceIdentity");
+    private static final QName ATT_RESUME = new QName("resume");
     /**
      * Attributes the <b>framework</b> reads off a stage, which the operator never sees.
      * <p>
@@ -124,6 +125,24 @@ public class StreamPipelineFactory {
                         + " \"strict\", \"warn\" or \"off\"");
             }
             pipeline.setSourceIdentity(policy);
+        }
+
+        OMAttribute resume = elem.getAttribute(ATT_RESUME);
+        if (resume != null) {
+            boolean value = parseBoolean(pipeline.getName(), "resume", resume.getAttributeValue());
+            if (value) {
+                // Refused rather than accepted-as-a-no-op. resume="true" reads as "make this pipeline
+                // resumable", which no attribute can do: durability is a property of the run, decided
+                // by the source's origin and whether the provider gave it an identity. Accepting it
+                // silently would let a deployer believe they had configured resume for an API body.
+                // ADR-0018 made exactly this mistake and ADR-0019 removed it -- see ADR-0033.
+                throw new SynapseException("stream pipeline '" + pipeline.getName() + "' has"
+                        + " 'resume=\"true\"'. Resume cannot be switched on: it happens when the source"
+                        + " can be re-read and the caller gave it an identity, which only the caller"
+                        + " knows. The attribute exists to decline resume with resume=\"false\";"
+                        + " remove it to allow resume where the run qualifies");
+            }
+            pipeline.setResume(false);
         }
 
         // Cloned BEFORE buildOperators, which strips the framework-reserved stage attributes off the
@@ -199,8 +218,28 @@ public class StreamPipelineFactory {
         }
     }
 
+    /**
+     * How to name a stage in a parse-time message, before any operator necessarily exists.
+     *
+     * <p>Deliberately the <b>configuration</b>, not the operator. A connector operation is resolved
+     * from its template long after parsing — that is the whole point of the deferred route — so there
+     * is no instance to ask, and asking one anyway is how this method used to throw a
+     * {@code NullPointerException} that surfaced as "Stream pipeline configuration cannot be built"
+     * with nothing pointing at the cause.
+     *
+     * <p>It is also the better label even where an operator does exist: a connector operation's
+     * {@code name()} is a class constant shared by every stage using it, while the configured name is
+     * what distinguishes them and what the deployer actually wrote.
+     */
+    private static String stageLabel(OMElement childElem) {
+        OMAttribute nameAttr = childElem.getAttribute(ATT_NAME);
+        String configured = nameAttr == null ? null : nameAttr.getAttributeValue();
+        return (configured == null || configured.trim().isEmpty())
+                ? childElem.getLocalName() : configured.trim();
+    }
+
     private static Integer parseMaxReprocessed(String pipelineName, int index,
-                                               StreamOperator operator, String value) {
+                                               String stage, String value) {
         if (value == null) {
             return null;
         }
@@ -219,7 +258,7 @@ public class StreamPipelineFactory {
         }
         if (parsed > 1 && log.isInfoEnabled()) {
             log.info("Stream pipeline '" + pipelineName + "' operator " + index + " ('"
-                    + operator.name() + "') is configured with maxReprocessed=" + parsed
+                    + stage + "') is configured with maxReprocessed=" + parsed
                     + ", so up to " + parsed + " units may be reprocessed after a failure and any side"
                     + " effects in them repeated. Configured deliberately; recorded here so it is"
                     + " visible.");
@@ -267,7 +306,8 @@ public class StreamPipelineFactory {
                             + childElem.getLocalName() + ">: " + e.getMessage(), e);
                 }
                 pipeline.addOperator(operator, nameIsExplicit,
-                        parseMaxReprocessed(pipeline.getName(), index, operator, maxReprocessedAttr));
+                        parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
+                                maxReprocessedAttr));
                 index++;
                 continue;
             }
@@ -288,10 +328,12 @@ public class StreamPipelineFactory {
                 OMAttribute nameAttr = childElem.getAttribute(ATT_NAME);
                 pipeline.addOperation(invoke, childElem.getLocalName(),
                         nameAttr == null ? null : nameAttr.getAttributeValue(), nameIsExplicit,
-                        parseMaxReprocessed(pipeline.getName(), index, null, maxReprocessedAttr));
+                        parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
+                                maxReprocessedAttr));
             } else if (mediator instanceof StreamOperator operator) {
                 pipeline.addOperator(operator, nameIsExplicit,
-                        parseMaxReprocessed(pipeline.getName(), index, operator, maxReprocessedAttr));
+                        parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
+                                maxReprocessedAttr));
             } else {
                 throw new StreamException("<" + childElem.getLocalName() + "> at position " + index
                         + " is not a stream operator. A pipeline stage must be a registered stream"
@@ -322,9 +364,11 @@ public class StreamPipelineFactory {
             OMAttribute a = (OMAttribute) it.next();
             String local = a.getQName().getLocalPart();
             if (!"name".equals(local) && !"sourceProvided".equals(local)
-                    && !"sourceIdentity".equals(local) && !"key".equals(local)) {
+                    && !"sourceIdentity".equals(local) && !"resume".equals(local)
+                    && !"key".equals(local)) {
                 throw new SynapseException("<streamPipeline> has an unknown attribute '" + local
-                        + "'. Known attributes are 'name', 'sourceProvided' and 'sourceIdentity'");
+                        + "'. Known attributes are 'name', 'sourceProvided', 'sourceIdentity' and"
+                        + " 'resume'");
             }
         }
     }

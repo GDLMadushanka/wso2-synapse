@@ -90,6 +90,36 @@ public interface StreamOperator {
      *
      * @return {@code true} only if output is byte-identical for identical input, always
      */
+    /**
+     * Checks the configuration a deployer wrote, at <b>deployment</b>, before any file is touched.
+     *
+     * <h2>Why this exists</h2>
+     * A connector operation reads its parameters from the bound message, so by default nothing looks
+     * at them until a run starts — and a typo then surfaces as a failed transfer over a real customer
+     * file. Worse, it surfaces as a failure the framework cannot attribute: once bytes are moving,
+     * "this column will not parse as an integer" is indistinguishable from a bad file, and guessing
+     * wrong either deletes data or retries forever.
+     *
+     * <p>The fix is to make that class of error impossible to reach. A structural mistake — an
+     * unknown {@code format}, malformed {@code dataTypes} JSON, {@code chunk} mode without a
+     * {@code chunkSize} — is decidable from the configuration alone, with no file in hand. Decided
+     * here, the artifact is faulty and nothing runs; left to runtime, it becomes a question about the
+     * customer's data that has no answer.
+     *
+     * <h2>What it is given, and what it is not</h2>
+     * Only parameters whose value is <b>literal</b> in the artifact. A parameter written as an
+     * expression cannot be evaluated without a message, so it is absent from the map rather than
+     * present-and-wrong, and an implementation must tolerate that: treat a missing key as "cannot
+     * check", never as "not configured". The same {@code from(...)} the operator uses at runtime
+     * should do the work, so the two cannot drift.
+     *
+     * @param literalParameters the operation's literally-configured parameters, by name
+     * @throws StreamException if the configuration cannot produce a working run
+     */
+    default void validateConfiguration(java.util.Map<String, String> literalParameters)
+            throws StreamException {
+    }
+
     default boolean deterministic() {
         return false;
     }

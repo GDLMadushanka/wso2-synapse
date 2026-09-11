@@ -26,6 +26,11 @@ import org.apache.synapse.SynapseException;
 import org.apache.synapse.config.SynapseConfiguration;
 import org.apache.synapse.mediators.AbstractListMediator;
 import org.apache.synapse.mediators.ext.ClassMediator;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import org.apache.synapse.mediators.template.InvokeParam;
+import org.apache.synapse.mediators.Value;
 import org.apache.synapse.mediators.template.InvokeMediator;
 import org.apache.synapse.mediators.template.TemplateMediator;
 import org.apache.synapse.stream.StreamOperator;
@@ -84,6 +89,30 @@ class OperatorEntry {
     }
 
     /** An operator built at parse time, by the operator SPI. */
+    /**
+     * The parameters this stage was configured with, for the ones written as literals.
+     *
+     * <p>An expression cannot be evaluated without a message, so it is <b>omitted</b> rather than
+     * included with a placeholder — a checker must be able to tell "not configured" from "configured,
+     * but not knowable yet", and only absence says the second honestly.
+     *
+     * <p>Empty for an SPI-built operator, which holds its configuration in its own fields and has
+     * nothing template-shaped to read.
+     */
+    Map<String, String> literalParameters() {
+        if (invoke == null || invoke.getpName2ParamMap() == null) {
+            return Collections.emptyMap();
+        }
+        Map<String, String> literals = new LinkedHashMap<>();
+        for (Map.Entry<String, InvokeParam> param : invoke.getpName2ParamMap().entrySet()) {
+            Value value = param.getValue() == null ? null : param.getValue().getInlineValue();
+            if (value != null && !value.hasExprTypeKey() && value.getKeyValue() != null) {
+                literals.put(param.getKey(), value.getKeyValue());
+            }
+        }
+        return literals;
+    }
+
     static OperatorEntry ofOperator(StreamOperator operator, String elementName) {
         return new OperatorEntry(operator, null, elementName);
     }
@@ -180,6 +209,11 @@ class OperatorEntry {
 
         StreamOperator operator() {
             return operator;
+        }
+
+        /** The literal parameters of the entry this came from — see {@link OperatorEntry#literalParameters}. */
+        Map<String, String> literalParameters() {
+            return OperatorEntry.this.literalParameters();
         }
 
         /**

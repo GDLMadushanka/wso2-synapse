@@ -408,6 +408,45 @@ public class StreamPipelineFactoryTest {
     }
 
     /**
+     * A connector operation carrying {@code maxReprocessed} parses.
+     *
+     * <p>It did not. {@code parseMaxReprocessed} logged the widened bound using
+     * {@code operator.name()}, and the connector branch has <b>no operator</b> to ask — that is the
+     * whole point of the deferred route. So a pipeline with
+     * {@code <streaming.forEach maxReprocessed="1000"/>} died with a {@code NullPointerException}
+     * that surfaced only as <i>"Stream pipeline configuration cannot be built - Continue in fail-safe
+     * mode"</i>, with the pipeline silently absent afterwards.
+     *
+     * <p>Note the trigger is a bound <b>above 1</b>: the dereference sat inside the "this is worth
+     * logging" guard, so every value of 1 or an absent attribute went straight past it. The SPI-route
+     * tests above all pass a real operator, which is why none of them caught it.
+     */
+    @Test
+    public void aConnectorOperationMayCarryMaxReprocessed() throws Exception {
+        MediatorFactoryFinder finder = MediatorFactoryFinder.getInstance();
+        Map<String, SynapseImport> saved = finder.getSynapseImportMap();
+        try {
+            SynapseImport imp = new SynapseImport();
+            imp.setLibName("streaming");
+            imp.setLibPackage("org.wso2.carbon.connector");
+            imp.setStatus(true);
+            Map<String, SynapseImport> imports = new HashMap<>();
+            imports.put("{org.wso2.carbon.connector}streaming", imp);
+            finder.setSynapseImportMap(imports);
+
+            StreamPipeline p = build("<streamPipeline name=\"ingest\" " + NS + ">"
+                    + "<test.classpathSource/>"
+                    + "<streaming.forEach name=\"rows\" maxReprocessed=\"1000\"/>"
+                    + "</streamPipeline>");
+
+            assertTrue(p.hasDeferredStages());
+            assertEquals("the deployer's bound must survive parsing", 1000, p.maxReprocessed(1));
+        } finally {
+            finder.setSynapseImportMap(saved);
+        }
+    }
+
+    /**
      * A connector operation parses even though its class is nowhere — an {@code InvokeMediator} holds a
      * template <i>name</i>, so nothing has to be loaded. That is what lets a pipeline naming
      * {@code <file.streamWrite>} survive being read before the library deployer has run.
@@ -448,6 +487,55 @@ public class StreamPipelineFactoryTest {
             }
         } finally {
             finder.setSynapseImportMap(saved);
+        }
+    }
+
+    // ------------------------------------------------------------------ resume
+
+    /** The deployer may decline resume. Absent, a qualifying run still resumes. */
+    @Test
+    public void resumeFalseIsAccepted() throws Exception {
+        StreamPipeline p = build("<streamPipeline xmlns=\"http://ws.apache.org/ns/synapse\""
+                + " name=\"decline\" resume=\"false\"><test.classpathSource/><test.classpathSink/></streamPipeline>");
+        assertFalse(p.isResume());
+
+        StreamPipeline dflt = build("<streamPipeline xmlns=\"http://ws.apache.org/ns/synapse\""
+                + " name=\"default\"><test.classpathSource/><test.classpathSink/></streamPipeline>");
+        assertTrue("resume is allowed unless declined", dflt.isResume());
+    }
+
+    /**
+     * {@code resume="true"} is refused rather than accepted as a no-op.
+     *
+     * <p>It reads as "make this pipeline resumable", which no attribute can do — durability is a
+     * property of the run, decided by the source's origin and whether the provider gave it an identity.
+     * Accepting it silently would let a deployer believe they had configured resume for an API body.
+     * ADR-0018 made this mistake, ADR-0019 removed it, and ADR-0033 must not bring it back.
+     */
+    @Test
+    public void resumeTrueIsRefusedBecauseItCannotBeHonoured() throws Exception {
+        try {
+            build("<streamPipeline xmlns=\"http://ws.apache.org/ns/synapse\" name=\"claim\""
+                    + " resume=\"true\"><test.classpathSource/><test.classpathSink/></streamPipeline>");
+            fail("expected resume=\"true\" to be refused");
+        } catch (SynapseException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("cannot be switched on"));
+            assertTrue("the message must name the way to decline",
+                    e.getMessage().contains("resume=\"false\""));
+        }
+    }
+
+    /** And it is a known attribute, so the unknown-attribute rule does not reject it. */
+    @Test
+    public void resumeIsAKnownAttribute() throws Exception {
+        try {
+            build("<streamPipeline xmlns=\"http://ws.apache.org/ns/synapse\" name=\"typo\""
+                    + " resumee=\"false\"><test.classpathSource/><test.classpathSink/></streamPipeline>");
+            fail("expected a typo to be refused");
+        } catch (SynapseException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("resumee"));
+            assertTrue("the list of known attributes must mention resume",
+                    e.getMessage().contains("'resume'"));
         }
     }
 }
