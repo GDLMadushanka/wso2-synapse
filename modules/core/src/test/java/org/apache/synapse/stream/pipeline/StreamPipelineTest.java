@@ -28,6 +28,7 @@ import org.apache.synapse.stream.JobStore;
 import org.apache.synapse.stream.JobStores;
 import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamOrigin;
+import org.apache.synapse.stream.StreamShutdown;
 import org.apache.synapse.stream.StreamSeed;
 import org.junit.Test;
 
@@ -39,6 +40,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -904,12 +906,21 @@ public class StreamPipelineTest {
             p.setWorkspaceRoot(root.toString());
             p.setSourceProvided(true);
             p.addOperator(new Mocks.Checkpointing("position"), true);
+            // Deliberately made to fail. Reclaiming a finished run also clears its positions, so after
+            // a SUCCESSFUL run "cleared" cannot distinguish the guard from the reclaim. A failed run
+            // keeps its state, which leaves the guard as the only thing that could have cleared.
+            p.addOperator(new Mocks.FailingTransform("boom"), true);
             p.addOperator(new Mocks.Sink("sink"), true);
             p.validate();
 
-            p.execute(null, jobWithId("job-9"),
-                    new StreamSeed(new ByteArrayInputStream(DATA), "file:/in/a.csv", 99L, 5678L,
-                            StreamOrigin.REOPENABLE));
+            try {
+                p.execute(null, jobWithId("job-9"),
+                        new StreamSeed(new ByteArrayInputStream(DATA), "file:/in/a.csv", 99L, 5678L,
+                                StreamOrigin.REOPENABLE));
+                fail("the failing stage was supposed to fail");
+            } catch (StreamException expected) {
+                assertEquals("boom", expected.getStage());
+            }
 
             assertTrue("the provider said this is the same source; the framework must not disagree",
                     cleared.isEmpty());
@@ -1073,6 +1084,108 @@ public class StreamPipelineTest {
         }
     }
 
+    // ------------------------------------------------------------ graceful shutdown
+
+    /**
+     * A shutdown stops a <b>resumable</b> run, and the position it had earned is recorded.
+     *
+     * <p>Not "run until the next checkpoint": that waits a whole interval to save at most
+     * {@code maxReprocessed} units of rework. Stopping at the next unit and writing what is already
+     * finished costs one record instead, and loses nothing. ADR-0037.
+     */
+    @Test
+    public void aShutdownStopsAResumableRunAndKeepsWhatItEarned() throws Exception {
+        MemoryCheckpoints store = new MemoryCheckpoints();
+        store.install();
+        try {
+            Path root = Files.createTempDirectory("mft-shutdown");
+            Mocks.Sink sink = new Mocks.Sink("sink");
+            StreamPipeline p = pipeline("stopping");
+            p.setSourceProvided(true);
+            p.setWorkspaceRoot(root.toString());
+            // An interval of 1000 over ten records: without a flush on stopping, nothing would ever be
+            // recorded and the whole run would be repeated.
+            // The signal arrives after four records, as a shutdown would mid-transfer.
+            p.addOperator(new Mocks.ByteRecords("rows", 0, 4), true, 1000);
+            p.addOperator(sink, true);
+            p.validate();
+
+            try {
+                p.execute(null, jobWithId("job-stop"), seedOf("ABCDEFGHIJ"));
+                fail("a run that stopped short of its source's end did not finish, and saying so is"
+                        + " the only thing that stops the caller consuming the source");
+            } catch (StreamException e) {
+                assertTrue(e.getMessage(), e.getMessage().contains("stopped before the transfer"));
+                assertTrue("whoever drives retries must be told to try again", e.isRetryable());
+            }
+
+            assertEquals("a resumable run stops at the next unit, keeping what finished",
+                    "ABCD", textOf(sink));
+            Checkpoint recorded = store.rows.get("job-stop/rows");
+            assertNotNull("the position it reached must be recorded, not thrown away", recorded);
+            assertEquals("and it must be what actually completed",
+                    textOf(sink).length(), recorded.position());
+            // The half that used to undo the other: a run that looks finished reclaims its workspace
+            // and clears its positions, which deleted the flush above one line after writing it.
+            assertTrue("a stopped run keeps the workspace its position describes",
+                    Files.exists(root.resolve("stopping").resolve("job-stop")));
+        } finally {
+            StreamShutdown.reset();
+            store.uninstall();
+        }
+    }
+
+    /**
+     * A run nothing could redo is left to finish.
+     *
+     * <p>An API request body is {@code ONE_SHOT}: stopping it destroys bytes no retry can obtain again,
+     * so it gets the same contract as any other in-flight mediation. `resumable` is the discriminator
+     * rather than the origin, because an API over a re-openable file source has no seed either.
+     */
+    @Test
+    public void aShutdownLetsANonResumableRunFinish() throws Exception {
+        MemoryCheckpoints store = new MemoryCheckpoints();
+        store.install();
+        try {
+            Path root = Files.createTempDirectory("mft-shutdown-oneshot");
+            Mocks.Sink sink = new Mocks.Sink("sink");
+            StreamPipeline p = pipeline("finishing");
+            p.setSourceProvided(true);
+            p.setWorkspaceRoot(root.toString());
+            p.addOperator(new Mocks.ByteRecords("rows", 0), true, 1000);
+            p.addOperator(sink, true);
+            p.validate();
+
+            StreamShutdown.request();
+            p.execute(null, JobContext.NOOP,
+                    new StreamSeed(new ByteArrayInputStream("ABCDEFGHIJ".getBytes(StandardCharsets.UTF_8)),
+                            "mem:/one-shot", 10L, 1L, StreamOrigin.ONE_SHOT));
+
+            assertEquals("nothing would redo this, so it must not be cut short",
+                    "ABCDEFGHIJ", textOf(sink));
+        } finally {
+            StreamShutdown.reset();
+            store.uninstall();
+        }
+    }
+
+    /** The signal counts transfers, so a shutdown can wait for them. */
+    @Test
+    public void inFlightTransfersAreCountedAndWaitedFor() throws Exception {
+        StreamShutdown.reset();
+        assertEquals(0, StreamShutdown.inFlight());
+        assertTrue("nothing running means immediately quiet", StreamShutdown.awaitQuiet(50));
+
+        StreamShutdown.started();
+        try {
+            assertEquals(1, StreamShutdown.inFlight());
+            assertFalse("a running transfer must hold the wait", StreamShutdown.awaitQuiet(50));
+        } finally {
+            StreamShutdown.ended();
+        }
+        assertTrue(StreamShutdown.awaitQuiet(50));
+    }
+
     // ------------------------------------------------------------ resume: artifact prefix replay
 
     /**
@@ -1169,7 +1282,7 @@ public class StreamPipelineTest {
 
     /** A checkpoint store that survives between two execute() calls, as the database would. */
     private static final class MemoryCheckpoints {
-        private final Map<String, Checkpoint> rows = new HashMap<>();
+        final Map<String, Checkpoint> rows = new HashMap<>();
 
         void install() {
             CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
@@ -1825,7 +1938,9 @@ public class StreamPipelineTest {
 
         assertEquals(root.resolve("csv-ingest").resolve("job-7").resolve("mat"), mat.seen);
         assertNotNull("a materialising stage is handed an artifact", mat.seenArtifact);
-        assertTrue("created before the operator ran", Files.isDirectory(mat.seen));
+        // Asked of the operator, not of the filesystem: a successful run reclaims its workspace, so
+        // what is on disk afterwards says nothing about what the stage was handed.
+        assertTrue("created before the operator ran", mat.seenDirectoryExisted);
     }
 
     /**
@@ -1918,8 +2033,9 @@ public class StreamPipelineTest {
             p.validate();
             p.execute(null, jobWithId("job-9"));
 
-            assertEquals(1, asked.size());
-            assertEquals("ckpt-wired/job-9/position", asked.get(0));
+            // Asked more than once now -- the build asks, and reclaiming a finished run asks again to
+            // clear the position it will never need. The key is what this pins.
+            assertEquals(Set.of("ckpt-wired/job-9/position"), new java.util.HashSet<>(asked));
         } finally {
             CheckpointStores.register(null);
         }

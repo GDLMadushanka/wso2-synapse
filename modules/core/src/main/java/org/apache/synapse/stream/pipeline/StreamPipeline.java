@@ -43,6 +43,7 @@ import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamOperator;
 import org.apache.synapse.stream.StreamOrigin;
 import org.apache.synapse.stream.StreamSeed;
+import org.apache.synapse.stream.StreamShutdown;
 import org.apache.synapse.stream.StreamSink;
 import org.apache.synapse.stream.StreamSource;
 import org.apache.synapse.stream.StreamTransform;
@@ -836,10 +837,14 @@ public class StreamPipeline implements ManagedLifecycle {
 
         // From here on the caller's context is wrapped, so an operator reporting progress writes a row
         // without knowing this happens. Both obligations are met by one call.
-        RecordingJobContext recorder = new RecordingJobContext(jobCtx, store, runId.value());
+        // Only a resumable run stops on shutdown; see ADR-0037 and the field's javadoc.
+        RecordingJobContext recorder = new RecordingJobContext(jobCtx, store, runId.value(), resumable);
         jobCtx = recorder;
 
         List<StageStream> stages = new ArrayList<>();
+        // Kept so a run stopped on request can record what each stage had already earned. Nothing else
+        // needs them after the build, which is why they were local until now.
+        List<DefaultStreamContext> contexts = new ArrayList<>();
         StreamException primary = null;
 
         /**
@@ -857,6 +862,7 @@ public class StreamPipeline implements ManagedLifecycle {
         long sinkElapsedNanos = -1L;
 
         ResourceScope resources = new ResourceScope();
+        StreamShutdown.started();
         try {
             // ---- phase 1: build. No bytes move. -------------------------------------------
             InputStream current = null;
@@ -881,6 +887,7 @@ public class StreamPipeline implements ManagedLifecycle {
                 String stage = stageNameAt(i, op);
                 DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, op, stage, runId.value(),
                         runDir, maxReprocessed(i));
+                contexts.add(ctx);
 
                 if (op instanceof StreamSink s) {
                     sink = s;
@@ -1008,6 +1015,21 @@ public class StreamPipeline implements ManagedLifecycle {
                 drain(current, jobCtx);
             }
 
+            // A run that was told to stop did not finish, whatever the chain reported. An operator
+            // that polls cancellation returns EOF when it stops -- from here, indistinguishable from
+            // an exhausted source -- so without this the pipeline would publish a partial artifact,
+            // record the run as complete, and reclaim the very positions the stop had just earned.
+            // Thrown, and thrown BEFORE `pulled`, because failure is the only outcome the unwind
+            // below has for "did not finish": it aborts instead of committing, keeps a resumable
+            // run's workspace, and tells the caller not to consume the source. See ADR-0038.
+            if (recorder.isCancelled()) {
+                throw new StreamException("stream pipeline '" + name + "' stopped before the transfer"
+                        + " finished because " + (StreamShutdown.requested()
+                                ? "the server is shutting down" : "the run was cancelled")
+                        + (resumable ? "; the work it had recorded is kept and the next attempt"
+                                + " resumes from there" : ""), true);
+            }
+
             pulled = true;
 
         } catch (StageStream.StageIOException e) {
@@ -1034,6 +1056,11 @@ public class StreamPipeline implements ManagedLifecycle {
             recorder.recordFailure(sinkName(), "STREAM_PIPELINE_ERROR", t.toString(), false);
             throw t;
         } finally {
+            // Before anything is closed, because recording a position flushes and fsyncs the artifact
+            // it describes -- and abort() closes those streams.
+            if (recorder.isCancelled()) {
+                flushEarnedPositions(contexts, runId.value());
+            }
             try {
                 if (pulled && primary == null) {
                     resources.close();
@@ -1054,10 +1081,24 @@ public class StreamPipeline implements ManagedLifecycle {
                 }
             }
             reportStagesQuietly(jobCtx, stages, sinkStage, sinkElapsedNanos);
-            reclaimScratchWorkspace(runDir, resumable, runId.value());
+            reclaimWorkspace(runDir, resumable && !(pulled && primary == null), runId.value());
+            StreamShutdown.ended();
         }
 
         if (primary != null) {
+            if (recorder.isCancelled()) {
+                // Expected, not broken. An operator that stopped when it was told to is not a fault
+                // to diagnose, so this does not go out at ERROR alongside real failures -- during a
+                // shutdown every in-flight transfer lands here at once.
+                log.warn(LoggingUtils.getFormattedLog(SynapseConstants.STREAM_PIPELINE_TYPE, name,
+                        "run '" + runId.value() + "' stopped before the transfer finished"
+                                + (resumable ? "; its workspace and positions are kept, so the next"
+                                        + " attempt resumes from where it stopped"
+                                        : "; it published nothing and will be redone whole")));
+                recorder.recordFailure(primary.getStage(), "STREAM_PIPELINE_STOPPED",
+                        withRootCause(primary), primary.isRetryable());
+                throw primary;
+            }
             // Logged here rather than left to whoever catches it, and this is the whole reason:
             // execute() throws, the mediator rethrows as a SynapseException, and a fault sequence
             // that formats a response discards the cause chain entirely. The message a caller sees
@@ -1186,15 +1227,29 @@ public class StreamPipeline implements ManagedLifecycle {
      * a question this needs to ask: a pipeline ending in a materialising transform is doing its work
      * through side effects, and its artifact is spill exactly like any other stage's.
      *
-     * <p>The one case left alone is a <b>resumable</b> run, whose artifacts are resume candidates while
-     * it is in flight. Once it has succeeded they are arguably garbage too, but that is retention
-     * policy — an open question, and not one to decide from inside a run.
+     * <h2>A run that succeeded is reclaimed too, not only a scratch one</h2>
+     * Once a run is {@code DONE} nothing can read its workspace again, so keeping it is not caution but
+     * a leak. Three facts make that certain rather than a policy choice. Its output left through a sink
+     * to a deployer-chosen path, so everything here is spill — ADR-0029. Its artifact was renamed to the
+     * final name, so a later attempt with the same identity finds no partial, hits {@code L > A} and
+     * re-runs regardless. And the segment short-circuit that a kept artifact would serve belongs to a
+     * run that <i>failed</i> partway, never to one that finished.
+     *
+     * <p>This is also the only place a successful run's checkpoints are cleared. They were surviving
+     * every completed run, accumulating a row per stage per run forever, and describing state nothing
+     * would ever consult.
+     *
+     * <p>The one case left alone is a <b>resumable run that did not succeed</b>: its artifacts are
+     * resume candidates and its positions still describe work someone will continue from. A run stopped
+     * on shutdown is one of these, which is what keeps the position flushed on the way out
+     * (ADR-0038) from being deleted by this method moments later. How long such a workspace may sit
+     * there unclaimed is retention policy — an open question, and not one to decide from inside a run.
      *
      * <p>Never throws. The bytes have already landed and the run's outcome is settled; failing it now
      * over a directory that could not be removed would turn a successful transfer into a failed one.
      */
-    private void reclaimScratchWorkspace(Path runDir, boolean resumable, String runId) {
-        if (resumable) {
+    private void reclaimWorkspace(Path runDir, boolean keep, String runId) {
+        if (keep) {
             return;
         }
         try {
@@ -1212,8 +1267,8 @@ public class StreamPipeline implements ManagedLifecycle {
                 discardWorkspace(runDir);
             }
             if (log.isDebugEnabled()) {
-                log.debug("stream pipeline '" + name + "' reclaimed the scratch state of run '"
-                        + runId + "'; nothing could have resumed from it");
+                log.debug("stream pipeline '" + name + "' reclaimed the state of run '" + runId
+                        + "'; nothing can resume from it");
             }
         } catch (StreamException | RuntimeException e) {
             log.warn("stream pipeline '" + name + "' could not reclaim the scratch state of run '"
@@ -1732,6 +1787,36 @@ public class StreamPipeline implements ManagedLifecycle {
                 throw new StreamException("operator " + i + " ('" + stageNameAt(i, op)
                         + "') of stream pipeline '" + name + "' is misconfigured: " + e.getMessage(),
                         e, false).withStage(stageNameAt(i, op));
+            }
+        }
+    }
+
+    /**
+     * Records what each stage had already finished, for a run that was asked to stop.
+     *
+     * <p>A checkpoint is normally deferred until {@code maxReprocessed} units have passed, so a run
+     * stopped between intervals would replay units it had genuinely completed. On a deliberate stop
+     * that is pure waste — the deployer asked for this, and the work is done.
+     *
+     * <p>Only for a stop that was <b>asked for</b>. A run that failed is left alone: its artifact may be
+     * mid-append, and the existing checkpoint already describes the last state anyone confirmed.
+     *
+     * <p>Each stage is flushed independently and a failure in one does not stop the others — every
+     * position saved is rework avoided, and none of them depend on each other. A stage that cannot be
+     * flushed simply resumes from its previous checkpoint, which is what would have happened anyway.
+     */
+    private void flushEarnedPositions(List<DefaultStreamContext> contexts, String runId) {
+        for (DefaultStreamContext ctx : contexts) {
+            StageArtifact artifact = ctx.canonicalArtifact();
+            if (artifact == null) {
+                continue;
+            }
+            try {
+                artifact.flushPosition();
+            } catch (IOException | RuntimeException e) {
+                log.warn("stream pipeline '" + name + "' could not record the position stage '"
+                        + ctx.stageName() + "' had reached when run '" + runId + "' was stopped;"
+                        + " it will resume from its previous checkpoint and repeat that work", e);
             }
         }
     }

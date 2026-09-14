@@ -304,5 +304,24 @@ public interface StageArtifact {
      * @throws IOException           if the file could not be made durable or renamed
      * @throws IllegalStateException if called on the canonical artifact rather than a named one
      */
+    /**
+     * Records the position already earned, without waiting for {@code maxReprocessed} to come round.
+     *
+     * <p>For a stop the deployer asked for — a shutdown, a cancellation. {@code unitDone} normally skips
+     * the checkpoint while fewer than {@code maxReprocessed} units have passed, so a run stopped between
+     * intervals would replay units it had genuinely finished. This writes what is owed and nothing more:
+     * the position it records is the last unit that <b>completed</b>, so it is safe at any moment.
+     *
+     * <p>Costs one fsync, and turns "wait for the next checkpoint" into "stop at the next unit" — the
+     * difference between a shutdown delayed by an interval and one delayed by a record. Called by the
+     * framework at the end of a cancelled run, not by operators: see ADR-0037.
+     *
+     * <p>Does nothing for an artifact with no checkpoint store, and nothing when the position has not
+     * moved since the last checkpoint.
+     *
+     * @throws IOException if the artifact could not be made durable; the position is then not advanced
+     */
+    void flushPosition() throws IOException;
+
     void seal() throws IOException;
 }

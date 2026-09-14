@@ -18,6 +18,9 @@
 
 package org.apache.synapse.stream.pipeline;
 
+import org.apache.synapse.stream.Checkpoint;
+import org.apache.synapse.stream.CheckpointStore;
+import org.apache.synapse.stream.CheckpointStores;
 import org.apache.synapse.MessageContext;
 import org.apache.synapse.SynapseConstants;
 import org.apache.synapse.TestMessageContext;
@@ -556,7 +559,7 @@ public class JobRecordingTest {
      * retention policy, and deliberately not decided from inside a run.
      */
     @Test
-    public void keepsTheWorkspaceOfAResumableRun() throws Exception {
+    public void keepsTheWorkspaceOfAResumableRunThatDidNotSucceed() throws Exception {
         new Recording().install();
 
         Path root = Files.createTempDirectory("mft-resumable");
@@ -564,13 +567,23 @@ public class JobRecordingTest {
         p.setWorkspaceRoot(root.toString());
         p.setSourceProvided(true);
         p.addOperator(new Mocks.LazyMaterialising("spill"), true);
+        // Made to fail deliberately. Resumability alone no longer keeps a workspace -- a finished run
+        // reclaims its own, because nothing can read it again (ADR-0036). What is kept is the narrower
+        // and actually useful case: a resumable run that did NOT succeed, whose artifacts are resume
+        // candidates and whose positions still mean something.
+        p.addOperator(new Mocks.FailingTransform("boom"), true);
         p.addOperator(new Mocks.Sink("write"), true);
         p.validate();
 
         // A caller-supplied job id makes the run id stable, and the seed is re-openable.
-        p.execute(null, jobId("job-keep"), seed("file:/in/a.csv", 16L, 1234L));
+        try {
+            p.execute(null, jobId("job-keep"), seed("file:/in/a.csv", 16L, 1234L));
+            fail("the failing stage was supposed to fail");
+        } catch (StreamException expected) {
+            assertEquals("boom", expected.getStage());
+        }
 
-        assertTrue("a resumable run's artifacts are resume candidates",
+        assertTrue("an interrupted resumable run's artifacts are resume candidates",
                 Files.isDirectory(root.resolve("resumable").resolve("job-keep")));
     }
 
@@ -600,6 +613,56 @@ public class JobRecordingTest {
 
     // ------------------------------------------------------------------ the source-identity guard
 
+    /**
+     * A run that succeeded reclaims its own workspace and clears its positions.
+     *
+     * <p>ADR-0029 reclaimed only what could never be resumed, which is a statement about capability and
+     * left a completed resumable run's spill behind forever. Nothing can read it: the output left
+     * through the sink, the artifact was renamed so a later attempt hits {@code L > A} and re-runs, and
+     * the segment short-circuit a kept artifact would serve belongs to a run that failed partway.
+     * ADR-0036.
+     */
+    @Test
+    public void aFinishedRunReclaimsItsWorkspaceAndItsPositions() throws Exception {
+        new Recording().install();
+        List<String> cleared = new ArrayList<>();
+        CheckpointStores.register((pipelineName, runId, stageName) -> new CheckpointStore() {
+            @Override
+            public Checkpoint lastComplete() {
+                return null;
+            }
+
+            @Override
+            public void append(Checkpoint checkpoint) {
+            }
+
+            @Override
+            public void clear() {
+                cleared.add(stageName);
+            }
+        });
+        try {
+            Path root = Files.createTempDirectory("mft-finished");
+            // One checkpointed stage, not two: R18 forbids a checkpointed stage below a
+            // non-deterministic materialising one, and materialising()'s LazyMaterialising is not.
+            StreamPipeline p = pipeline("finished");
+            p.setWorkspaceRoot(root.toString());
+            p.setSourceProvided(true);
+            p.addOperator(new Mocks.Checkpointing("position"), true);
+            p.addOperator(new Mocks.Sink("write"), true);
+            p.validate();
+
+            p.execute(null, jobId("job-done"), seed("file:/in/a.csv", 16L, 1234L));
+
+            assertFalse("a finished run's workspace is spill nothing can read",
+                    Files.exists(root.resolve("finished").resolve("job-done")));
+            assertTrue("and its positions describe state nothing will consult",
+                    cleared.contains("position"));
+        } finally {
+            CheckpointStores.register(null);
+        }
+    }
+
     /** A pipeline with a materialising stage, so the run actually has a workspace to discard. */
     private static StreamPipeline materialising(String name, Path root) {
         StreamPipeline p = pipeline(name);
@@ -609,6 +672,32 @@ public class JobRecordingTest {
         return p;
     }
 
+    /**
+     * A materialising pipeline that always fails, for asserting what the <b>source-identity guard</b>
+     * left behind.
+     *
+     * <p>Needed because a run that succeeds now reclaims its own workspace and clears its positions
+     * (ADR-0036), which would mask the guard entirely: "the directory is gone" could mean the guard
+     * discarded it or the run simply finished. Failing the run removes the second explanation.
+     */
+    private static StreamPipeline materialisingThatFails(String name, Path root) {
+        StreamPipeline p = materialising(name, root);
+        p.addOperator(new Mocks.FailingTransform("boom"), true);
+        p.addOperator(new Mocks.Sink("write"), true);   // R11: a transform may not be last
+        return p;
+    }
+
+    /** Runs a pipeline expected to fail at {@code boom}, so the assertions afterwards are about state. */
+    private static void executeExpectingFailure(StreamPipeline p, JobContext job, StreamSeed seed)
+            throws Exception {
+        try {
+            p.execute(null, job, seed);
+            fail("the failing stage was supposed to fail");
+        } catch (StreamException expected) {
+            assertEquals("boom", expected.getStage());
+        }
+    }
+
     @Test
     public void anUnchangedSourceKeepsItsWorkspace() throws Exception {
         Recording store = new Recording();
@@ -616,7 +705,7 @@ public class JobRecordingTest {
         store.install();
 
         Path root = Files.createTempDirectory("mft-guard-same");
-        StreamPipeline p = materialising("same", root);
+        StreamPipeline p = materialisingThatFails("same", root);
         p.validate();
 
         Path stage = root.resolve("same").resolve("job-1").resolve("mat");
@@ -624,7 +713,7 @@ public class JobRecordingTest {
         Path marker = stage.resolve("artifact.out");
         Files.writeString(marker, "earlier attempt");
 
-        p.execute(null, jobId("job-1"), seed("file:/in/a.csv", 16L, 1234L));
+        executeExpectingFailure(p, jobId("job-1"), seed("file:/in/a.csv", 16L, 1234L));
 
         assertTrue("an unchanged source must not lose its resume candidate", Files.exists(marker));
     }
@@ -636,7 +725,7 @@ public class JobRecordingTest {
         store.install();
 
         Path root = Files.createTempDirectory("mft-guard-warn");
-        StreamPipeline p = materialising("warned", root);
+        StreamPipeline p = materialisingThatFails("warned", root);
         assertEquals(SourceIdentityPolicy.WARN, p.getSourceIdentity());
         p.validate();
 
@@ -646,7 +735,7 @@ public class JobRecordingTest {
         Files.writeString(stale, "bytes of a file that is no longer there");
 
         // Same job id, a different identity underneath it — the retry case the guard exists for.
-        p.execute(null, jobId("job-2"), seed("file:/in/a.csv|99|5678", 99L, 5678L));
+        executeExpectingFailure(p, jobId("job-2"), seed("file:/in/a.csv|99|5678", 99L, 5678L));
 
         assertFalse("resuming into another source's artifact is the corruption this prevents",
                 Files.exists(stale));
@@ -682,7 +771,7 @@ public class JobRecordingTest {
         store.install();
 
         Path root = Files.createTempDirectory("mft-guard-off");
-        StreamPipeline p = materialising("off", root);
+        StreamPipeline p = materialisingThatFails("off", root);
         p.setSourceIdentity(SourceIdentityPolicy.OFF);
         p.validate();
 
@@ -691,7 +780,7 @@ public class JobRecordingTest {
         Path kept = stage.resolve("artifact.out");
         Files.writeString(kept, "kept deliberately");
 
-        p.execute(null, jobId("job-4"), seed("file:/in/a.csv", 99L, 5678L));
+        executeExpectingFailure(p, jobId("job-4"), seed("file:/in/a.csv", 99L, 5678L));
 
         assertTrue(Files.exists(kept));
     }

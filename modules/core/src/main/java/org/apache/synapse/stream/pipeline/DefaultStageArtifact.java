@@ -97,6 +97,12 @@ public class DefaultStageArtifact implements StageArtifact {
     /** Input position of the last checkpoint written or resumed from. */
     private long lastCheckpointPosition;
 
+    /**
+     * The payload from the most recent {@link #unitDone}, so {@link #flushPosition} can record the
+     * operator's state as it was at the position it is writing — not an older one, and not none.
+     */
+    private String lastPayload;
+
     /** Monotonicity guard on {@link #unitDone}. */
     private long lastReportedPosition = -1L;
 
@@ -377,6 +383,7 @@ public class DefaultStageArtifact implements StageArtifact {
         }
         start();
         lastReportedPosition = position;
+        lastPayload = payload;
 
         long advanced = position - lastCheckpointPosition;
         if (advanced < maxReprocessed) {
@@ -403,6 +410,25 @@ public class DefaultStageArtifact implements StageArtifact {
         // 3. and only then.
         store.append(new Checkpoint(position, appendedLength, unit, formatVersion, payload));
         lastCheckpointPosition = position;
+    }
+
+    @Override
+    public void flushPosition() throws IOException {
+        if (store == null || unit == null || lastReportedPosition <= lastCheckpointPosition) {
+            return;
+        }
+        // Same order as unitDone, and it must be: durable first, position second. The gate is the only
+        // thing skipped, because this is the moment the gate exists to defer to.
+        if (out != null) {
+            out.flush();
+            fileOut.getFD().sync();
+        }
+        store.append(new Checkpoint(lastReportedPosition, appendedLength, unit, formatVersion,
+                lastPayload));
+        log.info("stage '" + stageName + "' recorded position " + lastReportedPosition + " " + unit
+                + " on stopping, " + (lastReportedPosition - lastCheckpointPosition)
+                + " unit(s) beyond its last checkpoint; that work will not be repeated");
+        lastCheckpointPosition = lastReportedPosition;
     }
 
     @Override

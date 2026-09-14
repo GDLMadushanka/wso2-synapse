@@ -22,6 +22,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.stream.JobContext;
 import org.apache.synapse.stream.JobStore;
+import org.apache.synapse.stream.StreamShutdown;
 
 /**
  * A {@link JobContext} that mirrors everything reported to the caller into the run's {@link JobStore}.
@@ -62,7 +63,21 @@ final class RecordingJobContext implements JobContext {
     /** Guards against recording two terminal states, which a failure during commit could otherwise do. */
     private boolean terminal;
 
+    /**
+     * Whether a server shutdown should stop this run, which is true only if something would redo it.
+     *
+     * <p>A resumable run stops at its next unit and a retry continues from the checkpoint. A
+     * non-resumable one is left to finish: stopping an API request body destroys bytes nothing can
+     * obtain again, so it gets the same contract as any other in-flight mediation. See ADR-0037.
+     */
+    private final boolean stopsOnShutdown;
+
     RecordingJobContext(JobContext delegate, JobStore store, String runId) {
+        this(delegate, store, runId, false);
+    }
+
+    RecordingJobContext(JobContext delegate, JobStore store, String runId, boolean stopsOnShutdown) {
+        this.stopsOnShutdown = stopsOnShutdown;
         this.delegate = delegate;
         this.store = store;
         this.runId = runId;
@@ -191,7 +206,9 @@ final class RecordingJobContext implements JobContext {
 
     @Override
     public boolean isCancelled() {
-        return delegate.isCancelled();
+        // The shutdown signal reaches an operator through the JobContext it already holds, so no
+        // caller has to be taught to pass anything new -- this decorator wraps every run.
+        return delegate.isCancelled() || (stopsOnShutdown && StreamShutdown.requested());
     }
 
     private void quietly(String what, RuntimeException e) {

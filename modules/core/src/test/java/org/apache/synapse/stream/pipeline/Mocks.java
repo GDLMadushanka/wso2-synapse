@@ -138,6 +138,13 @@ final class Mocks {
         private final String name;
         java.nio.file.Path seen;
         org.apache.synapse.stream.StageArtifact seenArtifact;
+        /**
+         * Whether the stage directory existed at the moment the operator was handed it.
+         *
+         * <p>Captured here rather than checked after the run, because a successful run now reclaims
+         * its workspace — so the filesystem afterwards says nothing about what the operator saw.
+         */
+        boolean seenDirectoryExisted;
         int seenMaxReprocessed;
 
         CapturingWorkspace(String name) {
@@ -158,6 +165,7 @@ final class Mocks {
         public InputStream wrap(InputStream in, StreamContext ctx) {
             seen = ctx.workspace();
             seenArtifact = ctx.artifact();
+            seenDirectoryExisted = java.nio.file.Files.isDirectory(seen);
             seenMaxReprocessed = ctx.maxReprocessed();
             return new java.io.FilterInputStream(in) { };
         }
@@ -821,11 +829,18 @@ final class Mocks {
 
         private final String name;
         private final int failAfter;
+        /** Raises the server shutdown signal after this many records, so it arrives mid-run. */
+        private final int shutdownAfter;
         private final AtomicInteger emitted = new AtomicInteger();
 
         ByteRecords(String name, int failAfter) {
+            this(name, failAfter, 0);
+        }
+
+        ByteRecords(String name, int failAfter, int shutdownAfter) {
             this.name = name;
             this.failAfter = failAfter;
+            this.shutdownAfter = shutdownAfter;
         }
 
         @Override
@@ -861,6 +876,12 @@ final class Mocks {
                         started = true;
                         record = artifact.resumePosition();
                         in.skipNBytes(record);          // one byte per record
+                    }
+                    if (shutdownAfter > 0 && emitted.get() >= shutdownAfter) {
+                        org.apache.synapse.stream.StreamShutdown.request();
+                    }
+                    if (ctx.job().isCancelled()) {
+                        return -1;          // between records, as a real operator stops
                     }
                     if (failAfter > 0 && emitted.get() >= failAfter) {
                         throw new IOException(name + " failed after " + failAfter + " records");
