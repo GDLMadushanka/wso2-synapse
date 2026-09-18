@@ -60,6 +60,16 @@ final class RecordingJobContext implements JobContext {
     /** Chain position for the next stage to finish. {@link JobContext} carries no index of its own. */
     private int nextStageIndex;
 
+    /**
+     * What each stage reported spending in deployer-supplied mediation, until the stage row is written.
+     *
+     * <p>Concurrent because the reporting operator's thread and the unwind are not guaranteed to be
+     * the same one, and the map is tiny -- one entry per stage that has any mediation at all, which
+     * today means one entry at most.
+     */
+    private final java.util.Map<String, Long> mediationNanos =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     /** Guards against recording two terminal states, which a failure during commit could otherwise do. */
     private boolean terminal;
 
@@ -100,11 +110,25 @@ final class RecordingJobContext implements JobContext {
     @Override
     public void stageFinished(String stage, long bytesIn, long bytesOut, long selfNanos) {
         try {
-            store.stageFinished(runId, stage, nextStageIndex++, bytesIn, bytesOut, selfNanos);
+            // The mediation figure arrives separately, from the operator, while the run is still
+            // going -- and the stage row is written here, at the end. Folded in rather than written
+            // on its own so the row is created once: a separate write would either be clobbered by
+            // this one or have to create the row itself, and then two writers would own it.
+            store.stageFinished(runId, stage, nextStageIndex++, bytesIn, bytesOut, selfNanos,
+                    mediationNanos.getOrDefault(stage, -1L));
         } catch (RuntimeException e) {
             quietly("stageFinished", e);
         }
         delegate.stageFinished(stage, bytesIn, bytesOut, selfNanos);
+    }
+
+    @Override
+    public void stageMediation(String stage, long nanos) {
+        // Highest wins, never last. The figure is cumulative and arrives repeatedly, so a put would
+        // let any out-of-order or late zero erase a real total -- the same way a plain assignment let
+        // the sink's "no records" erase a transform's record count.
+        mediationNanos.merge(stage, nanos, Math::max);
+        delegate.stageMediation(stage, nanos);
     }
 
     /**
@@ -144,6 +168,19 @@ final class RecordingJobContext implements JobContext {
      *
      * <p>Also delegates to the caller, so exactly one call reports and records.
      */
+    /**
+     * Records that this run stopped on request, and reports whether it did.
+     *
+     * @param stateDiscarded whether the run threw away what it had earned
+     */
+    void recordStopped(boolean stateDiscarded) {
+        try {
+            store.stopped(runId, stateDiscarded);
+        } catch (RuntimeException e) {
+            quietly("stopped", e);
+        }
+    }
+
     void recordFailure(String stage, String code, String message, boolean retryable) {
         if (!terminal) {
             terminal = true;
@@ -202,6 +239,16 @@ final class RecordingJobContext implements JobContext {
     @Override
     public void checksum(String stage, String algorithm, String value) {
         delegate.checksum(stage, algorithm, value);
+    }
+
+    /**
+     * Forwarded, and it has to be: this class wraps the caller's context and answers for it, so a
+     * question it does not forward silently returns {@link JobContext}'s default. That default is
+     * {@code false} -- keep the state -- which turned every stop into a pause.
+     */
+    @Override
+    public boolean discardStateOnStop() {
+        return delegate.discardStateOnStop();
     }
 
     @Override

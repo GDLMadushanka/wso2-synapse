@@ -37,8 +37,10 @@ import org.apache.synapse.stream.JobRun;
 import org.apache.synapse.stream.JobStore;
 import org.apache.synapse.stream.JobStores;
 import org.apache.synapse.stream.ResourceScope;
+import org.apache.synapse.stream.SourceIdentity;
 import org.apache.synapse.stream.StageArtifact;
 import org.apache.synapse.stream.SourceIdentityPolicy;
+import org.apache.synapse.stream.Invoker;
 import org.apache.synapse.stream.StreamException;
 import org.apache.synapse.stream.StreamOperator;
 import org.apache.synapse.stream.StreamOrigin;
@@ -161,6 +163,14 @@ public class StreamPipeline implements ManagedLifecycle {
      * the operator's default". Set from the {@code maxReprocessed} stage attribute.
      */
     private final List<Integer> maxReprocessed = new ArrayList<>();
+
+    /**
+     * Per stage: the deployer's {@code deterministic} attribute, or {@code null} for "ask the
+     * operator". Only consulted for an operator that declares
+     * {@link StreamOperator#defersDeterminismToDeployer()}; set on any other, it is refused at
+     * validation rather than quietly ignored.
+     */
+    private final List<Boolean> deterministic = new ArrayList<>();
 
     /**
      * What to do when a retry finds a different source than the attempt it is resuming. Defaults to
@@ -347,10 +357,31 @@ public class StreamPipeline implements ManagedLifecycle {
             // Every stage above is scanned, not just the nearest: non-determinism propagates through
             // a deterministic stage, because a deterministic stage fed different input produces
             // different output.
+            Boolean declaredDeterministic = i < deterministic.size() ? deterministic.get(i) : null;
+            if (declaredDeterministic != null && !op.defersDeterminismToDeployer()) {
+                // Refused rather than ignored. Silently dropping it would leave a deployer believing
+                // they had asserted something, and the belief is the dangerous part: they would then
+                // put a checkpointed stage below it expecting the assertion to make that legal.
+                throw new StreamException(where + " has deterministic=\"" + declaredDeterministic
+                        + "\", but this operator answers that itself -- what it does is fixed in its"
+                        + " own code, so the attribute would be overriding a fact with a guess. It is"
+                        + " accepted only on an operator whose output is produced by configuration you"
+                        + " wrote, such as a per-record loop running a sequence");
+            }
+            if (Boolean.TRUE.equals(declaredDeterministic) && !op.deterministic()) {
+                // Worth a line in the log because it is an assertion, not a setting: if it is wrong the
+                // result is a complete, plausible, wrong output file rather than a failure.
+                log.info("stream pipeline '" + name + "' stage '" + stageNameAt(i, op) + "' is"
+                        + " configured deterministic=\"true\", so a stage below it may keep a resume"
+                        + " position across its output. That is your assertion that the same input"
+                        + " produces byte-identical output -- a sequence that calls a backend, reads a"
+                        + " clock or generates an id does not");
+            }
+
             if (op.checkpointed()) {
                 for (int j = 0; j < i; j++) {
                     StreamOperator above = operators.get(j);
-                    if (above.materialises() && !above.deterministic()) {
+                    if (above.materialises() && !deterministicAt(j, above)) {
                         throw new StreamException(where + " declares checkpointed(), but operator "
                                 + j + " ('" + stageNameAt(j, above) + "') above it materialises"
                                 + " without declaring deterministic(). A failure re-derives that"
@@ -433,17 +464,11 @@ public class StreamPipeline implements ManagedLifecycle {
             }
         }
 
-        // The guard compares this attempt's source identity against the previous attempt's, and that
-        // identity only exists when the caller supplies a StreamSeed. A pipeline that opens its own
-        // source records none, so the comparison can never happen — and STRICT promises to refuse a
-        // changed source. A promise that cannot be kept is refused here rather than left inert.
-        if (sourceIdentity == SourceIdentityPolicy.STRICT && !sourceProvided) {
-            throw new StreamException("stream pipeline '" + name + "' declares"
-                    + " sourceIdentity=\"strict\" but opens its own source, so no source identity is"
-                    + " recorded and nothing can be compared against a later attempt. strict is only"
-                    + " honoured for sourceProvided=\"true\" pipelines, whose caller supplies the"
-                    + " identity along with the stream");
-        }
+        // A pipeline that opens its own source used to be refused STRICT here, because no identity was
+        // recorded for it and a promise that cannot be kept is worse than no promise. StreamSource can
+        // now identify a resource before the run, so the comparison is possible on both paths and the
+        // refusal is gone. A source that returns null from identify() still records nothing — then
+        // STRICT simply never has two identities to compare, which is inert rather than wrong.
 
         for (int i = 0; i < operators.size(); i++) {
             StreamOperator op = operators.get(i);
@@ -571,10 +596,10 @@ public class StreamPipeline implements ManagedLifecycle {
             // was already stronger than anything the composition could express. Deciding what
             // distinguishes two sources is the provider's job -- ADR-0033.
             String material = name + '\0' + seed.identity();
-            return new RunId("src-" + Integer.toHexString(material.hashCode())
+            return new RunId(RunId.SOURCE_PREFIX + Integer.toHexString(material.hashCode())
                     + '-' + Long.toHexString(fnv1a(material)), true);
         }
-        return new RunId("run-" + UUID.randomUUID(), false);
+        return new RunId(RunId.SCRATCH_PREFIX + UUID.randomUUID(), false);
     }
 
     /**
@@ -607,7 +632,41 @@ public class StreamPipeline implements ManagedLifecycle {
     }
 
     /** A run's workspace name, and whether anything may resume from it. */
+    /**
+     * A run's name, and whether anything may resume from it.
+     *
+     * <h2>The prefix says which rule named the run, and that is load-bearing</h2>
+     * All three share {@code mft-} so a run id is recognisable as one; the segment after it says how the
+     * name was arrived at, which is the same thing as saying whether a second attempt can resume:
+     *
+     * <pre>
+     *   mft-job-1423                  the caller named it. Resumes -- the next attempt asks for the
+     *                                 same id, so it lands in the same workspace
+     *   mft-src-3f9a1c2d-8b04e771     content-addressed from the pipeline and the source's identity.
+     *                                 Resumes -- re-presenting the same unchanged source lands here again
+     *   mft-run-&lt;uuid&gt;                nothing stable was available. SCRATCH: a second attempt gets a
+     *                                 different name, so nothing can be resumed and nothing is kept
+     * </pre>
+     *
+     * <p>An operator reading {@code mft-run-} in a log knows, without opening anything, that a restart
+     * will start this transfer over. That is worth more than a uniform format, which is why the three
+     * are not collapsed into one.
+     *
+     * <p>{@code mft-job-} is the one the framework does <b>not</b> control: case 1 uses whatever id the
+     * caller supplied. {@code MFTTransferService} supplies {@code mft-job-&lt;jobId&gt;} through
+     * {@code Transfer.runName()}; another caller could supply anything, so this is a convention among
+     * callers rather than a guarantee of the framework.
+     */
     record RunId(String value, boolean stable) {
+
+        /** Shared by every id the framework names, so one is recognisable on sight. */
+        static final String PREFIX = "mft-";
+
+        /** Content-addressed from the pipeline name and the seed's identity. Resumable. */
+        static final String SOURCE_PREFIX = PREFIX + "src-";
+
+        /** Nothing stable to name it after. Not resumable, and the id says so. */
+        static final String SCRATCH_PREFIX = PREFIX + "run-";
     }
 
     /**
@@ -676,9 +735,6 @@ public class StreamPipeline implements ManagedLifecycle {
         }
     }
 
-    /** What invoked a run: a kind, and the invoking artifact's name when one could be identified. */
-    record Invoker(String type, String name) {
-    }
 
     /**
      * Works out what invoked this run, so nobody has to remember to say.
@@ -706,33 +762,19 @@ public class StreamPipeline implements ManagedLifecycle {
     private Invoker resolveInvoker(MessageContext msg, JobContext jobCtx) {
         String declaredType = trimToNull(jobCtx.invokerType());
         if (declaredType != null) {
+            // A caller that knows better than the message says so -- the MFT processor, whose run was
+            // caused by a submission that happened on another thread, on another day, possibly on
+            // another node, and whose invocation path it alone can assemble.
             return new Invoker(declaredType, trimToNull(jobCtx.invokerName()));
         }
 
-        if (msg != null) {
-            String proxy = trimToNull(asString(msg.getProperty(SynapseConstants.PROXY_SERVICE)));
-            if (proxy != null) {
-                return new Invoker("PROXY", proxy);
-            }
-            // Carries "name:vX" for a versioned API, which is that API's real identity and is stored
-            // as such — anything filtering on it later has to match the same string.
-            String api = trimToNull(asString(msg.getProperty(RESTConstants.SYNAPSE_REST_API)));
-            if (api != null) {
-                return new Invoker("API", api);
-            }
-            String inbound = trimToNull(
-                    asString(msg.getProperty(SynapseConstants.INBOUND_ENDPOINT_NAME)));
-            if (inbound != null) {
-                return new Invoker("INBOUND", inbound);
-            }
+        Invoker identified = Invoker.of(msg);
+        if (identified != null) {
+            return identified;
         }
 
         // Reached by a pipeline run from a plain sequence, and by tests, which pass no context at all.
-        return new Invoker("DIRECT", trimToNull(jobCtx.invokerName()));
-    }
-
-    private static String asString(Object value) {
-        return value == null ? null : value.toString();
+        return new Invoker(Invoker.DIRECT, trimToNull(jobCtx.invokerName()));
     }
 
     private static String trimToNull(String value) {
@@ -820,20 +862,48 @@ public class StreamPipeline implements ManagedLifecycle {
                     + "): checkpointing is off and any materialised output is scratch");
         }
 
-        Path runDir = prepareWorkspace(runId.value());
+        // Everything an operator may register is released together, and the probe below may open a
+        // connection to look at its resource, so the scope exists before anything can use it.
+        ResourceScope resources = new ResourceScope();
 
-        // Every run is recorded, whether or not the caller wanted reporting: a partial answer to "what
-        // is running" is worse than none. NOOP when no provider is registered, which is the normal
-        // state for a Synapse with no datasource behind it.
-        JobStore store = JobStores.storeFor(name);
-        Invoker invoker = resolveInvoker(msg, jobCtx);
-        JobRecord prior = store.start(new JobRun(runId.value(), name, invoker.type(), invoker.name(),
-                resumable, runDir == null ? null : runDir.toString(),
-                seed == null ? null : seed.identity(),
-                seed == null ? StreamSeed.UNKNOWN : seed.size(),
-                seed == null ? StreamSeed.UNKNOWN : seed.lastModified()));
+        // What this attempt is about to read: from the seed when a caller supplied one, and from the
+        // source itself otherwise. This is the only moment it can be learned -- open() may perform no
+        // I/O, and by the first read the workspace has already been chosen and a previous attempt's
+        // artifacts possibly adopted. See StreamSource#identify.
+        //
+        // Before prepareWorkspace, deliberately. A source that has vanished is the commonest failure
+        // the probe exists for, and reporting it must leave nothing behind: a directory tree per
+        // attempt for a transfer that never moved a byte is litter the operator then has to identify
+        // as litter.
+        JobStore store;
+        Path runDir;
+        // Nothing here moves a byte, but the probe was handed the scope, so anything it registered is
+        // this block's to release: the try/finally that normally does it does not start until the
+        // build below, and a failure before then would otherwise leave a connection open with no
+        // run to account for it. abort(), not close(), for the same reason as the build's -- a
+        // committing resource must never publish on a path that failed.
+        try {
+            SourceIdentity identified = identifySource(msg, jobCtx, seed, runId.value(), resumable,
+                    resources);
 
-        runDir = guardSourceIdentity(prior, seed, runId, runDir);
+            runDir = prepareWorkspace(runId.value());
+
+            // Every run is recorded, whether or not the caller wanted reporting: a partial answer to
+            // "what is running" is worse than none. NOOP when no provider is registered, which is the
+            // normal state for a Synapse with no datasource behind it.
+            store = JobStores.storeFor(name);
+            Invoker invoker = resolveInvoker(msg, jobCtx);
+            JobRecord prior = store.start(new JobRun(runId.value(), name, invoker.type(),
+                    invoker.name(), resumable, runDir == null ? null : runDir.toString(),
+                    identified == null ? null : identified.identity(),
+                    identified == null ? StreamSeed.UNKNOWN : identified.size(),
+                    identified == null ? StreamSeed.UNKNOWN : identified.lastModified()));
+
+            runDir = guardSourceIdentity(prior, identified, runId, runDir);
+        } catch (StreamException | RuntimeException | Error e) {
+            resources.abort();
+            throw e;
+        }
 
         // From here on the caller's context is wrapped, so an operator reporting progress writes a row
         // without knowing this happens. Both obligations are met by one call.
@@ -861,7 +931,6 @@ public class StreamPipeline implements ManagedLifecycle {
         String sinkStage = null;
         long sinkElapsedNanos = -1L;
 
-        ResourceScope resources = new ResourceScope();
         StreamShutdown.started();
         try {
             // ---- phase 1: build. No bytes move. -------------------------------------------
@@ -1081,7 +1150,12 @@ public class StreamPipeline implements ManagedLifecycle {
                 }
             }
             reportStagesQuietly(jobCtx, stages, sinkStage, sinkElapsedNanos);
-            reclaimWorkspace(runDir, resumable && !(pulled && primary == null), runId.value());
+            // A stop request discards what a pause would have kept. Read from the caller's context
+            // rather than inferred, because "stopped on request" cannot tell the two apart by itself:
+            // both arrive as isCancelled() and both throw before `pulled`.
+            boolean discardOnStop = recorder.isCancelled() && jobCtx.discardStateOnStop();
+            reclaimWorkspace(runDir, resumable && !(pulled && primary == null) && !discardOnStop,
+                    runId.value());
             StreamShutdown.ended();
         }
 
@@ -1090,13 +1164,23 @@ public class StreamPipeline implements ManagedLifecycle {
                 // Expected, not broken. An operator that stopped when it was told to is not a fault
                 // to diagnose, so this does not go out at ERROR alongside real failures -- during a
                 // shutdown every in-flight transfer lands here at once.
+                // The message has to branch on the same thing the unwind does, or it reports a pause
+                // while a stop is happening. It said "kept" whenever the run was resumable, which is
+                // true of both.
+                boolean discarding = jobCtx.discardStateOnStop();
                 log.warn(LoggingUtils.getFormattedLog(SynapseConstants.STREAM_PIPELINE_TYPE, name,
                         "run '" + runId.value() + "' stopped before the transfer finished"
-                                + (resumable ? "; its workspace and positions are kept, so the next"
-                                        + " attempt resumes from where it stopped"
-                                        : "; it published nothing and will be redone whole")));
-                recorder.recordFailure(primary.getStage(), "STREAM_PIPELINE_STOPPED",
-                        withRootCause(primary), primary.isRetryable());
+                                + (discarding
+                                        ? "; its workspace and positions are being discarded, so"
+                                                + " nothing can resume from it"
+                                        : resumable ? "; its workspace and positions are kept, so the"
+                                                + " next attempt resumes from where it stopped"
+                                                : "; it published nothing and will be redone whole")));
+                // Recorded as stopped, not failed. It reaches here as an exception because that is
+                // how the unwind aborts instead of committing -- but writing FAILED made the run row
+                // contradict the transfer row, which already says paused or cancelled, and a reader
+                // cannot tell which of two disagreeing endpoints lied.
+                recorder.recordStopped(jobCtx.discardStateOnStop());
                 throw primary;
             }
             // Logged here rather than left to whoever catches it, and this is the whole reason:
@@ -1124,18 +1208,19 @@ public class StreamPipeline implements ManagedLifecycle {
      * @return the workspace to use, which is a fresh one when a stale workspace was discarded
      * @throws StreamException under {@link SourceIdentityPolicy#STRICT}, or if the discard failed
      */
-    private Path guardSourceIdentity(JobRecord prior, StreamSeed seed, RunId runId, Path runDir)
-            throws StreamException {
+    private Path guardSourceIdentity(JobRecord prior, SourceIdentity identified, RunId runId,
+                                     Path runDir) throws StreamException {
 
-        if (prior == null || seed == null || !prior.hasSourceIdentity()
-                || sourceIdentity == SourceIdentityPolicy.OFF || sameSource(prior, seed)) {
+        if (prior == null || identified == null || !identified.hasIdentity()
+                || !prior.hasSourceIdentity() || sourceIdentity == SourceIdentityPolicy.OFF
+                || Objects.equals(prior.sourceId(), identified.identity())) {
             return runDir;
         }
 
         String detail = "run '" + runId.value() + "' of stream pipeline '" + name + "' previously read "
                 + describeSource(prior.sourceId(), prior.sourceSize(), prior.sourceLastModified())
                 + " but this attempt found "
-                + describeSource(seed.identity(), seed.size(), seed.lastModified());
+                + describeSource(identified.identity(), identified.size(), identified.lastModified());
 
         if (sourceIdentity == SourceIdentityPolicy.STRICT) {
             throw new StreamException(detail + "; sourceIdentity=\"strict\" refuses to continue", false);
@@ -1182,19 +1267,79 @@ public class StreamPipeline implements ManagedLifecycle {
         }
     }
 
-    /** Identity is all three fields: a same-sized rewrite at a new mtime is still a different source. */
     /**
-     * Whether this attempt is reading what the previous one read.
+     * What this attempt is about to read.
      *
-     * <p>Equality of two opaque strings, and nothing more. This used to compare the identity, the size
-     * and the modification time separately, which made the framework hold a second identity policy
-     * alongside the one in {@link #resolveRunId} — and a contradictory one. If a provider folds size
-     * and mtime into its identity, comparing them again is unreachable; if it deliberately leaves them
-     * out, comparing them overrides a decision the provider already made. Either way it was wrong, so
-     * there is now exactly one place that decides what "the same source" means, and it is not here.
+     * <p>A seed answers for itself. Otherwise the source is asked, which is the only way a queued
+     * transfer ever learns anything about its resource: {@code open()} may perform no I/O, and the
+     * first {@code read()} is too late — the workspace has been chosen and a previous attempt's
+     * artifacts may already have been adopted.
+     *
+     * <h2>Asked only when the answer can change something</h2>
+     * A run that keeps nothing durable has no previous attempt to be confused with, and
+     * {@code sourceIdentity="off"} says the deployer does not want the comparison. Either way the round
+     * trip — which for an object store is a billable request, per attempt — buys nothing, so it is not
+     * made.
+     *
+     * <h2>A probe never fails a run for a configuration reason</h2>
+     * If the operators cannot even be resolved, the build loop a moment later says so with the stage
+     * name and the missing template in the message, which is a better error than anything this could
+     * produce. A probe that cannot reach its <i>resource</i>, though, does propagate: that is the fast
+     * failure this exists for, and it costs nothing to report it before a workspace is built.
+     *
+     * @return what the source says it will read, or {@code null} if nobody could say
      */
-    private static boolean sameSource(JobRecord prior, StreamSeed seed) {
-        return Objects.equals(prior.sourceId(), seed.identity());
+    private SourceIdentity identifySource(MessageContext msg, JobContext jobCtx, StreamSeed seed,
+                                          String runId, boolean resumable, ResourceScope resources)
+            throws StreamException {
+
+        if (seed != null) {
+            return new SourceIdentity(seed.identity(), seed.size(), seed.lastModified());
+        }
+        if (sourceProvided || !resumable || sourceIdentity == SourceIdentityPolicy.OFF) {
+            return null;
+        }
+
+        OperatorEntry.Resolution resolution;
+        try {
+            List<OperatorEntry.Resolution> resolved = resolveForRun();
+            resolution = resolved.isEmpty() ? null : resolved.get(0);
+        } catch (RuntimeException e) {
+            log.debug("stream pipeline '" + name + "' could not resolve its first operator to identify"
+                    + " the source; the build will report why", e);
+            return null;
+        }
+        if (resolution == null || !(resolution.operator() instanceof StreamSource src)) {
+            return null;
+        }
+
+        String stage = stageNameAt(0, resolution.operator());
+        // No workspace. Identifying a resource is not a reason to create a stage directory, and a probe
+        // that wrote an artifact would be writing before the run was recorded.
+        DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, resolution.operator(), stage,
+                runId, null, maxReprocessed(0));
+
+        // Bound exactly as the build loop binds it: a connector operation reads its configuration --
+        // which connection, which path -- from the message, and identifying a resource needs the same
+        // configuration as opening it.
+        boolean bound = resolution.bind(msg);
+        try {
+            SourceIdentity identified = src.identify(ctx);
+            if (identified == null || !identified.hasIdentity()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("stream pipeline '" + name + "' stage '" + stage + "' does not identify"
+                            + " its source, so run '" + runId + "' resumes on its run id alone");
+                }
+                return null;
+            }
+            return identified;
+        } catch (StreamException e) {
+            throw e.getStage() == null ? e.withStage(stage) : e;
+        } finally {
+            if (bound) {
+                resolution.release(msg);
+            }
+        }
     }
 
     /**
@@ -1664,6 +1809,15 @@ public class StreamPipeline implements ManagedLifecycle {
      *                                  {@code name()} throws
      */
     public void addOperator(StreamOperator op, boolean nameIsExplicit, Integer maxReprocessed) {
+        addOperator(op, nameIsExplicit, maxReprocessed, null);
+    }
+
+    /**
+     * @param deterministic the deployer's {@code deterministic} attribute, or {@code null} to take the
+     *                      operator's own declaration
+     */
+    public void addOperator(StreamOperator op, boolean nameIsExplicit, Integer maxReprocessed,
+                            Boolean deterministic) {
         if (op == null) {
             throw new IllegalArgumentException("cannot add a null operator to pipeline '" + name + "'");
         }
@@ -1685,6 +1839,7 @@ public class StreamPipeline implements ManagedLifecycle {
         explicitNames.add(nameIsExplicit);
         stageNames.add(operatorName);
         this.maxReprocessed.add(maxReprocessed);
+        this.deterministic.add(deterministic);
     }
 
     /**
@@ -1703,6 +1858,17 @@ public class StreamPipeline implements ManagedLifecycle {
     public void addOperation(org.apache.synapse.mediators.template.InvokeMediator invoke,
                              String elementName, String stageName, boolean nameIsExplicit,
                              Integer maxReprocessed) {
+        addOperation(invoke, elementName, stageName, nameIsExplicit, maxReprocessed, null);
+    }
+
+    /**
+     * @param deterministic the deployer's {@code deterministic} attribute, or {@code null} to take the
+     *                      operator's own declaration. Checked once the connector resolves, since the
+     *                      operator that would honour it does not exist yet here
+     */
+    public void addOperation(org.apache.synapse.mediators.template.InvokeMediator invoke,
+                             String elementName, String stageName, boolean nameIsExplicit,
+                             Integer maxReprocessed, Boolean deterministic) {
         if (invoke == null) {
             throw new IllegalArgumentException("cannot add a null operation to pipeline '" + name + "'");
         }
@@ -1710,6 +1876,7 @@ public class StreamPipeline implements ManagedLifecycle {
         explicitNames.add(nameIsExplicit);
         stageNames.add(stageName == null || stageName.trim().isEmpty() ? elementName : stageName.trim());
         this.maxReprocessed.add(maxReprocessed);
+        this.deterministic.add(deterministic);
     }
 
     /**
@@ -1879,6 +2046,25 @@ public class StreamPipeline implements ManagedLifecycle {
     public int maxReprocessed(int index) {
         Integer configured = maxReprocessed.get(index);
         return configured != null ? configured : 1;
+    }
+
+    /**
+     * Whether stage {@code index} produces byte-identical output for byte-identical input.
+     *
+     * <p>The deployer's attribute when one was written and the operator defers to it; the operator's
+     * own declaration otherwise. Everything that reasons about determinism must come through here
+     * rather than calling {@link StreamOperator#deterministic()} directly, or the attribute would be
+     * honoured in some rules and ignored in others.
+     *
+     * @param index the stage
+     * @param op    the resolved operator for that stage
+     */
+    public boolean deterministicAt(int index, StreamOperator op) {
+        Boolean declared = index < deterministic.size() ? deterministic.get(index) : null;
+        if (declared != null && op.defersDeterminismToDeployer()) {
+            return declared;
+        }
+        return op.deterministic();
     }
 
     /** The operators, in chain order. */

@@ -85,4 +85,38 @@ public interface StreamSource extends StreamOperator {
     default StreamOrigin origin() {
         return StreamOrigin.REOPENABLE;
     }
+
+    /**
+     * Says what this source is about to read, <b>without reading it</b>.
+     *
+     * <h2>I/O is expected here — this is the one place it is</h2>
+     * The opposite of {@link #open(StreamContext)}, deliberately. One stat, one {@code HEAD}, one
+     * metadata call: enough to name the resource and measure it, and no more. Everything
+     * {@code open()} defers exists because the build loop runs before a byte moves; this runs
+     * <b>once</b>, before the run is named, precisely so the answer can decide what happens next.
+     *
+     * <h2>What it is for</h2>
+     * A queued transfer has no seed, so without this the framework knows nothing about the resource
+     * until the first {@code read()} — by which time the workspace has been chosen and a previous
+     * attempt's artifacts may already have been adopted. With it, a second attempt over a <i>replaced</i>
+     * resource is caught before it can splice two sources into one artifact, and
+     * {@code sourceIdentity="strict"} means something on a pipeline that opens its own source.
+     *
+     * <h2>Returning null is fine</h2>
+     * The default. A source that cannot identify a resource cheaply should say so rather than guess: the
+     * run then behaves exactly as it does today, resuming on the strength of its run id alone. What is
+     * <b>not</b> fine is an identity that two different resources could share — see
+     * {@link SourceIdentity}.
+     *
+     * <p>Called only when the answer can change something: a pipeline keeping durable state, with the
+     * source-identity guard on. A scratch run pays no round trip.
+     *
+     * @param ctx everything this operator gets for this one invocation
+     * @return what this source would open, or {@code null} if it cannot say cheaply
+     * @throws StreamException if the resource cannot be reached or does not exist. Retryable when it
+     *                         may appear later, which is the usual case for a queued transfer
+     */
+    default SourceIdentity identify(StreamContext ctx) throws StreamException {
+        return null;
+    }
 }

@@ -975,7 +975,7 @@ public class StreamPipelineTest {
                 StreamOrigin.REOPENABLE);
 
         assertFalse("a source that cannot be recognised cannot be resumed", id.stable());
-        assertTrue(id.value().startsWith("run-"));
+        assertTrue("the id says so on sight", id.value().startsWith("mft-run-"));
     }
 
     // ------------------------------------------------------------------ telemetry
@@ -1379,6 +1379,75 @@ public class StreamPipelineTest {
             assertTrue(e.getMessage(), e.getMessage().contains("without declaring deterministic()"));
             assertTrue("the message must name the stage above", e.getMessage().contains("forEach"));
             assertTrue("and offer the way out", e.getMessage().contains("Drop checkpointed()"));
+        }
+    }
+
+    /**
+     * The deployer's answer is honoured where the operator has said it cannot answer itself.
+     *
+     * <p>A per-record loop emits whatever the configured sequence emits. If those mediators are a pure
+     * transform of each record, the stage really is deterministic — and the only party who can see that
+     * is whoever wrote them.
+     */
+    @Test
+    public void aDeployerMayDeclareADeferringStageDeterministic() throws Exception {
+        withDurableState(() -> {
+            StreamPipeline p = pipeline("deployer-says-yes");
+            p.setSourceProvided(true);
+            p.setWorkspaceRoot(Files.createTempDirectory("mft-deployer-det").toString());
+            p.addOperator(new Mocks.DeferringMaterialising("forEach"), true, null, Boolean.TRUE);
+            p.addOperator(new Mocks.CheckpointingSink("sink"), true);
+
+            p.validate();       // would be refused without the attribute
+        });
+    }
+
+    /** And the other way: an explicit false is the same as saying nothing. */
+    @Test
+    public void aDeployerMayAlsoDeclareItNonDeterministic() {
+        StreamPipeline p = pipeline("deployer-says-no");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.DeferringMaterialising("forEach"), true, null, Boolean.FALSE);
+        p.addOperator(new Mocks.CheckpointingSink("sink"), true);
+        try {
+            p.validate();
+            fail("expected deterministic=false to leave the rule in force");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("without declaring deterministic()"));
+        }
+    }
+
+    /** With no attribute the operator still decides, so nothing about existing pipelines changes. */
+    @Test
+    public void aDeferringStageIsStillNonDeterministicWithNoAttribute() {
+        StreamPipeline p = pipeline("no-attribute");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.DeferringMaterialising("forEach"), true);
+        p.addOperator(new Mocks.CheckpointingSink("sink"), true);
+        try {
+            p.validate();
+            fail("expected the rule to hold when the deployer said nothing");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("without declaring deterministic()"));
+        }
+    }
+
+    /**
+     * Refused, not ignored, on an operator that answers for itself. Silently dropping it would leave a
+     * deployer believing they had asserted something — and then building on the belief.
+     */
+    @Test
+    public void theAttributeIsRefusedOnAnOperatorThatAnswersForItself() {
+        StreamPipeline p = pipeline("not-yours-to-say");
+        p.setSourceProvided(true);
+        p.addOperator(new Mocks.Checkpointing("forEach"), true, null, Boolean.TRUE);
+        p.addOperator(new Mocks.CheckpointingSink("sink"), true);
+        try {
+            p.validate();
+            fail("expected the attribute to be refused where the operator answers for itself");
+        } catch (StreamException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("answers that itself"));
+            assertTrue("the message must name the stage", e.getMessage().contains("forEach"));
         }
     }
 

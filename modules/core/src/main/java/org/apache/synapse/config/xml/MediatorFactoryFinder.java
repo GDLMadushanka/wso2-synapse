@@ -108,7 +108,8 @@ public class MediatorFactoryFinder implements XMLToObjectMapper {
             VariableMediatorFactory.class,
             ScatterGatherMediatorFactory.class,
             ThrowErrorMediatorFactory.class,
-            org.apache.synapse.config.xml.stream.StreamPipelineMediatorFactory.class
+            org.apache.synapse.config.xml.stream.StreamPipelineMediatorFactory.class,
+            org.apache.synapse.config.xml.stream.MftSubmitMediatorFactory.class
     };
 
     private final static MediatorFactoryFinder instance  = new MediatorFactoryFinder();

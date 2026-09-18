@@ -96,6 +96,7 @@ public class XMLConfigConstants {
     public static final QName TASK_MANAGER_ELT = new QName(SYNAPSE_NAMESPACE, "taskManager");
     public static final QName INBOUND_ENDPOINT_ELT = new QName(SYNAPSE_NAMESPACE, "inboundEndpoint");
     public static final QName STREAM_PIPELINE_ELT = new QName(SYNAPSE_NAMESPACE, "streamPipeline");
+    public static final QName MFT_SUBMIT_ELT = new QName(SYNAPSE_NAMESPACE, "mftSubmit");
     
     public static final String NULL_NAMESPACE = "";
     public static final Object QUARTZ_QNAME   =

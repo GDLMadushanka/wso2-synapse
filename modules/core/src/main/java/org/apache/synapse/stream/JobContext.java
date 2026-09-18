@@ -134,6 +134,36 @@ public interface JobContext {
     }
 
     /**
+     * How long this stage spent inside <b>deployer-supplied mediation</b>, as opposed to its own work.
+     *
+     * <p>Only one operator has anything to report here, and that is the point: {@code streaming.forEach}
+     * is the single place the pipeline hands control to a Synapse sequence, so it is the only stage
+     * whose time is partly someone else's. Everything else is framing, buffering and I/O — its own code
+     * — and leaving this unreported is the honest answer for those.
+     *
+     * <p>Why it is worth separating at all: a stage that takes six seconds tells a deployer nothing
+     * actionable. "Six seconds, of which five and a half were your sequence" tells them the framing is
+     * not the problem and sends them to the mediators they wrote. Reversed, it sends them to
+     * {@code maxReprocessed} and the record format instead.
+     *
+     * <p><b>Cumulative for the stage, and re-reported after every unit.</b> Not once at the end,
+     * because there is no end to report at: a {@code StageStream} is never closed by the framework —
+     * the pipeline releases through its {@link ResourceScope} — so an operator that saved its total
+     * for a final call reports nothing at all, and the column reads zero. Re-reporting the running
+     * total is cheap because it writes to a map, not to the database; the row is written once in the
+     * run's {@code finally} block like every other stage figure.
+     *
+     * <p>Because it is a running total rather than a delta, a recipient must keep the <b>highest</b>
+     * value it has seen and not the last. Equal values are therefore idempotent, and a late or
+     * duplicated report cannot lower the figure.
+     *
+     * @param stage the reporting stage's name
+     * @param nanos total wall time inside the sequence, summed over every unit
+     */
+    default void stageMediation(String stage, long nanos) {
+    }
+
+    /**
      * One stage has finished, with its final measurements.
      * <p>
      * {@code selfNanos} is <b>wall clock, not CPU</b>. A GC pause landing in this stage's read, a
@@ -182,6 +212,27 @@ public interface JobContext {
      *
      * @return {@code true} if cancellation has been requested
      */
+    /**
+     * Whether the state this run has earned should be <b>thrown away</b> when it stops.
+     *
+     * <p>Only consulted when {@link #isCancelled()} is true, and it is the whole difference between the
+     * two reasons a run stops on request:
+     *
+     * <ul>
+     *   <li><b>false — pause.</b> The workspace and the checkpoints survive, so the next attempt on
+     *       this run id resumes from the position this one reached. Also what a shutdown wants.</li>
+     *   <li><b>true — stop.</b> They are discarded as the run unwinds, so nothing can resume. The
+     *       caller has said they do not want this transfer, not that they want it later.</li>
+     * </ul>
+     *
+     * <p>Discarded by the run's own thread rather than by whoever asked, deliberately: only the node
+     * that owns a workspace may delete it (ADR-0028), and deleting under a live writer is the hazard
+     * that rule exists for. So a stop request costs one more unit of work before the files go.
+     */
+    default boolean discardStateOnStop() {
+        return false;
+    }
+
     default boolean isCancelled() {
         return false;
     }

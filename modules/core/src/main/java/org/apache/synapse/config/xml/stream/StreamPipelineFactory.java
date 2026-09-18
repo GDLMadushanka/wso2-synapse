@@ -73,7 +73,8 @@ public class StreamPipelineFactory {
      * operator factory rejects unknown attributes" stays correct without every factory having to
      * know this list.
      */
-    private static final Set<String> RESERVED_STAGE_ATTRIBUTES = Set.of("materialize", "maxReprocessed");
+    private static final Set<String> RESERVED_STAGE_ATTRIBUTES =
+            Set.of("materialize", "maxReprocessed", "deterministic");
 
     private static final QName DESCRIPTION_ELT =
             new QName(XMLConfigConstants.SYNAPSE_NAMESPACE, "description");
@@ -206,6 +207,33 @@ public class StreamPipelineFactory {
      * <p>{@code "false"} is accepted: it asks for the behaviour that already happens. A value that is
      * neither is a typo and is refused as one.
      */
+    /**
+     * Reads {@code deterministic="true|false"}.
+     *
+     * <p>Only the two words, and not Java's {@code Boolean.parseBoolean}, which answers {@code false}
+     * to everything it does not recognise. A deployer writing {@code deterministic="yes"} would then
+     * have asserted the opposite of what they meant, on an attribute whose whole purpose is to relax a
+     * safety rule.
+     *
+     * @return the deployer's answer, or {@code null} when the attribute was absent
+     */
+    private static Boolean parseDeterministic(String pipelineName, int index, String stage,
+                                              String value) throws StreamException {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        if ("true".equalsIgnoreCase(trimmed)) {
+            return Boolean.TRUE;
+        }
+        if ("false".equalsIgnoreCase(trimmed)) {
+            return Boolean.FALSE;
+        }
+        throw new StreamException("stream pipeline '" + pipelineName + "' operator " + index + " ('"
+                + stage + "') has 'deterministic=\"" + value + "\"'; expected \"true\" or"
+                + " \"false\"");
+    }
+
     private static void rejectUnhonouredMaterialize(String pipelineName, int index, String value) {
         if (value == null) {
             return;
@@ -291,6 +319,8 @@ public class StreamPipelineFactory {
             rejectUnhonouredMaterialize(pipeline.getName(), index,
                     takeReservedAttribute(childElem, "materialize"));
             String maxReprocessedAttr = takeReservedAttribute(childElem, "maxReprocessed");
+            Boolean deterministicAttr = parseDeterministic(pipeline.getName(), index,
+                    stageLabel(childElem), takeReservedAttribute(childElem, "deterministic"));
 
             // Whether the name was written down, as opposed to derived from position. Durable state
             // is keyed by name, so an operator that keeps any must have been named explicitly.
@@ -307,7 +337,7 @@ public class StreamPipelineFactory {
                 }
                 pipeline.addOperator(operator, nameIsExplicit,
                         parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
-                                maxReprocessedAttr));
+                                maxReprocessedAttr), deterministicAttr);
                 index++;
                 continue;
             }
@@ -329,11 +359,11 @@ public class StreamPipelineFactory {
                 pipeline.addOperation(invoke, childElem.getLocalName(),
                         nameAttr == null ? null : nameAttr.getAttributeValue(), nameIsExplicit,
                         parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
-                                maxReprocessedAttr));
+                                maxReprocessedAttr), deterministicAttr);
             } else if (mediator instanceof StreamOperator operator) {
                 pipeline.addOperator(operator, nameIsExplicit,
                         parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
-                                maxReprocessedAttr));
+                                maxReprocessedAttr), deterministicAttr);
             } else {
                 throw new StreamException("<" + childElem.getLocalName() + "> at position " + index
                         + " is not a stream operator. A pipeline stage must be a registered stream"

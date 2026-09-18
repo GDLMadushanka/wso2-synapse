@@ -288,19 +288,21 @@ public class StreamPipelineFactoryTest {
     }
 
     /**
-     * A pipeline that opens its own source records no source identity, so there is nothing for a later
-     * attempt to be compared against. strict promises to refuse a changed source; it could not, and sat
-     * inert instead. Refused at deployment rather than silently doing nothing.
+     * This used to be refused. A pipeline that opened its own source recorded no identity, so strict
+     * promised to refuse a changed source and could not — and a promise that cannot be kept is worse
+     * than no promise.
+     *
+     * <p>A source can now identify itself before the run (ADR-0046), so the comparison is possible on
+     * both paths and the refusal is gone. A source that declines to identify itself still records
+     * nothing, which leaves strict inert rather than wrong: there are simply never two identities to
+     * compare.
      */
     @Test
-    public void refusesStrictOnAPipelineThatOpensItsOwnSource() throws Exception {
-        try {
-            build("<streamPipeline name=\"ingest\" sourceIdentity=\"strict\" " + NS + ">"
-                    + "<test.classpathSource/><test.classpathSink/></streamPipeline>");
-            fail("strict cannot be honoured without a caller-supplied identity");
-        } catch (SynapseException e) {
-            assertTrue(e.getMessage(), e.getMessage().contains("opens its own source"));
-        }
+    public void strictIsAllowedOnAPipelineThatOpensItsOwnSource() throws Exception {
+        StreamPipeline p = build("<streamPipeline name=\"ingest\" sourceIdentity=\"strict\" " + NS + ">"
+                + "<test.classpathSource/><test.classpathSink/></streamPipeline>");
+
+        assertEquals(SourceIdentityPolicy.STRICT, p.getSourceIdentity());
     }
 
     @Test

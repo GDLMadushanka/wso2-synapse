@@ -91,8 +91,13 @@ public interface JobStore {
      * @param bytesOut  bytes this stage produced
      * @param selfNanos wall-clock time in this stage's own work
      */
+    /**
+     * @param mediationNanos time inside deployer-supplied mediation, or {@code -1} when the stage has
+     *                       none to report — which is every stage except {@code streaming.forEach}.
+     *                       Distinct from {@code 0}, which would claim a sequence ran instantly
+     */
     default void stageFinished(String runId, String stage, int index, long bytesIn, long bytesOut,
-                               long selfNanos) {
+                               long selfNanos, long mediationNanos) {
     }
 
     /**
@@ -132,6 +137,24 @@ public interface JobStore {
      * @param message   human-readable detail, free of credentials and payload bytes
      * @param retryable whether another attempt could plausibly succeed
      */
+    /**
+     * Records a run that stopped because someone asked it to, rather than because it broke.
+     *
+     * <p>A stopped run still arrives at the framework's unwind as an exception — that is how it aborts
+     * instead of committing — so without this it would be written {@code FAILED}, and the run row would
+     * contradict the transfer row that already says paused or cancelled. Two endpoints disagreeing
+     * about one event is worse than either answer alone, because the reader cannot tell which lied.
+     *
+     * <p>The same distinction {@code INTERRUPTED} draws for a node that died: <i>we were asked to
+     * stop</i> is not <i>it failed</i>, and it cannot be recovered after the fact.
+     *
+     * @param runId          the run
+     * @param stateDiscarded whether the workspace and checkpoints were thrown away — the difference
+     *                       between a pause, which can be resumed, and a stop, which cannot
+     */
+    default void stopped(String runId, boolean stateDiscarded) {
+    }
+
     default void failed(String runId, String stage, String code, String message, boolean retryable) {
     }
 }

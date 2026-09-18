@@ -49,6 +49,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -102,9 +103,12 @@ public class JobRecordingTest {
         }
 
         @Override
-        public void stageFinished(String runId, String stage, int index, long in, long out, long ns) {
+        public void stageFinished(String runId, String stage, int index, long in, long out, long ns,
+                                  long mediationNs) {
             raise();
-            events.add("stage:" + index + ":" + stage);
+            // The mediation figure is recorded alongside, so a stage that reported one is visibly
+            // different here from one that did not -- -1 rather than 0, which would read as instant.
+            events.add("stage:" + index + ":" + stage + (mediationNs >= 0 ? ":med" : ""));
         }
 
         @Override
@@ -609,6 +613,130 @@ public class JobRecordingTest {
         try (var runs = Files.list(root.resolve("terminal"))) {
             assertEquals("a sinkless pipeline's spill is still spill", 0L, runs.count());
         }
+    }
+
+    // ------------------------------------------------------------ identifying the source
+
+    /**
+     * A pipeline that opens its own source has no seed, so until it could be asked, nothing about the
+     * resource was known before the first read — by which point the workspace had been chosen. This is
+     * the whole reason {@code identify} exists.
+     */
+    @Test
+    public void aSourceThatIdentifiesItselfIsAskedOnceAndRecorded() throws Exception {
+        Recording recording = new Recording();
+        recording.install();
+        try {
+            Path root = Files.createTempDirectory("mft-identify");
+            Mocks.IdentifyingSource source =
+                    new Mocks.IdentifyingSource("src", DATA, "conn1|in/a.csv|16|9");
+            StreamPipeline p = pipeline("identifying");
+            p.setWorkspaceRoot(root.toString());
+            p.addOperator(source, true);
+            p.addOperator(new Mocks.Sink("sink"), true);
+            p.validate();
+
+            p.execute(null, jobId("job-id-1"), null);
+
+            assertEquals("asked once, before the run is named", 1, source.probes.get());
+            assertEquals("conn1|in/a.csv|16|9", recording.started.get(0).sourceId());
+        } finally {
+            JobStores.register(null);
+        }
+    }
+
+    /**
+     * The round trip is a stat on a local file and a billable request against an object store, paid on
+     * every attempt. A run that keeps nothing durable has no previous attempt to be confused with, so
+     * there is nothing the answer could change.
+     */
+    @Test
+    public void aSourceIsNotAskedWhenTheAnswerCouldChangeNothing() throws Exception {
+        Path root = Files.createTempDirectory("mft-identify-scratch");
+        Mocks.IdentifyingSource source = new Mocks.IdentifyingSource("src", DATA, "conn1|in/a.csv");
+        StreamPipeline p = pipeline("scratch");
+        p.setWorkspaceRoot(root.toString());
+        // resume="false": the deployer has declined resuming, so nothing can act on an identity.
+        p.setResume(false);
+        p.addOperator(source, true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, jobId("job-scratch"), null);
+
+        assertEquals("a scratch run must not pay for an answer it cannot use", 0, source.probes.get());
+    }
+
+    /** {@code sourceIdentity="off"} is the deployer saying they do not want the comparison. */
+    @Test
+    public void aSourceIsNotAskedWhenTheGuardIsOff() throws Exception {
+        Path root = Files.createTempDirectory("mft-identify-off");
+        Mocks.IdentifyingSource source = new Mocks.IdentifyingSource("src", DATA, "conn1|in/a.csv");
+        StreamPipeline p = pipeline("guard-off");
+        p.setWorkspaceRoot(root.toString());
+        p.setSourceIdentity(SourceIdentityPolicy.OFF);
+        p.addOperator(source, true);
+        p.addOperator(new Mocks.Sink("sink"), true);
+        p.validate();
+
+        p.execute(null, jobId("job-off"), null);
+
+        assertEquals(0, source.probes.get());
+    }
+
+    /**
+     * The guard on the path that could never have it. A second attempt over a <i>replaced</i> resource
+     * used to resume into the first attempt's artifacts and splice two sources into one output; now the
+     * identity says they differ before a byte is read.
+     */
+    @Test
+    public void aChangedSourceIsCaughtOnAPipelineThatOpensItsOwnSource() throws Exception {
+        Recording recording = new Recording();
+        recording.install();
+        try {
+            Path root = Files.createTempDirectory("mft-identify-changed");
+            Mocks.IdentifyingSource source =
+                    new Mocks.IdentifyingSource("src", DATA, "conn1|in/a.csv|16|9");
+            StreamPipeline p = pipeline("changed");
+            p.setWorkspaceRoot(root.toString());
+            p.setSourceIdentity(SourceIdentityPolicy.STRICT);
+            p.addOperator(source, true);
+            p.addOperator(new Mocks.Sink("sink"), true);
+            p.validate();
+
+            p.execute(null, jobId("job-changed"), null);
+
+            // What the first attempt left behind, as a job store would hand it back.
+            recording.prior = new JobRecord("job-changed", "FAILED", 1, "conn1|in/a.csv|16|9", 16L, 9L);
+            // The same job id -- a retry of the same submission -- over a file that was replaced.
+            source.identity = "conn1|in/a.csv|22|11";
+            try {
+                p.execute(null, jobId("job-changed"), null);
+                fail("strict must refuse to resume into another source's artifacts");
+            } catch (StreamException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("strict"));
+            }
+        } finally {
+            JobStores.register(null);
+        }
+    }
+
+    /** Saying nothing is a legitimate answer, and must behave exactly as it did before there was one. */
+    @Test
+    public void aSourceThatCannotIdentifyItselfStillRuns() throws Exception {
+        Path root = Files.createTempDirectory("mft-identify-null");
+        Mocks.IdentifyingSource source = new Mocks.IdentifyingSource("src", DATA, null);
+        StreamPipeline p = pipeline("unidentified");
+        p.setWorkspaceRoot(root.toString());
+        Mocks.Sink sink = new Mocks.Sink("sink");
+        p.addOperator(source, true);
+        p.addOperator(sink, true);
+        p.validate();
+
+        p.execute(null, jobId("job-null"), null);
+
+        assertEquals(1, source.probes.get());
+        assertArrayEquals(DATA, sink.bytes());
     }
 
     // ------------------------------------------------------------------ the source-identity guard

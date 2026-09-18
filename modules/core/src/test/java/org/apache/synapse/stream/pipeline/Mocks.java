@@ -70,6 +70,48 @@ final class Mocks {
     }
 
     /** A source that opens lazily and records whether anything touched it during the build. */
+    /** A source that can say what it is about to read, as a queued transfer's source must. */
+    static final class IdentifyingSource implements StreamSource {
+
+        private final String name;
+        private final byte[] data;
+        /** Swapped between attempts to stand for a file replaced underneath a retry. */
+        volatile String identity;
+        final AtomicInteger probes = new AtomicInteger();
+        final AtomicInteger opens = new AtomicInteger();
+
+        IdentifyingSource(String name, byte[] data, String identity) {
+            this.name = name;
+            this.data = data;
+            this.identity = identity;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public boolean materialises() {
+            // So the pipeline has durable state, which is the only condition under which identifying
+            // the source can change anything.
+            return true;
+        }
+
+        @Override
+        public org.apache.synapse.stream.SourceIdentity identify(StreamContext ctx) {
+            probes.incrementAndGet();
+            return identity == null ? null
+                    : new org.apache.synapse.stream.SourceIdentity(identity, data.length, 1L);
+        }
+
+        @Override
+        public InputStream open(StreamContext ctx) {
+            opens.incrementAndGet();
+            return ctx.resources().register(name, new CountingStream(data));
+        }
+    }
+
     static final class Source implements StreamSource {
 
         private final String name;
@@ -790,6 +832,38 @@ final class Mocks {
 
         @Override
         public boolean materialises() {
+            return true;
+        }
+
+        @Override
+        public InputStream wrap(InputStream upstream, StreamContext ctx) {
+            return new FilterInputStream(upstream) { };
+        }
+    }
+
+    /**
+     * Materialises, is not deterministic on its own, and says the deployer decides — a per-record loop
+     * running a deployer-written sequence.
+     */
+    static final class DeferringMaterialising implements StreamTransform {
+        private final String name;
+
+        DeferringMaterialising(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public boolean materialises() {
+            return true;
+        }
+
+        @Override
+        public boolean defersDeterminismToDeployer() {
             return true;
         }
 

@@ -21,6 +21,8 @@ package org.apache.synapse.stream;
 import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
+import java.util.HashMap;
+import java.util.Map;
 import java.io.InputStream;
 
 import static org.junit.Assert.assertEquals;
@@ -173,6 +175,91 @@ public class StreamContractsTest {
         assertEquals("noop", job.jobId());
         assertFalse(job.isCancelled());
         assertNull("a null expectedSize is the normal case, not an error", job.expectedSize());
+    }
+
+
+    // ---------- what a source says it is about to read ----------
+
+    /**
+     * A blank identity is no identity. Two sources that both said "" would compare equal, which is the
+     * one thing an identity may never do.
+     */
+    @Test
+    public void aBlankSourceIdentityIsNoIdentity() {
+        assertFalse(new SourceIdentity("   ", 1L, 1L).hasIdentity());
+        assertNull(new SourceIdentity("", 1L, 1L).identity());
+        assertTrue(new SourceIdentity("conn1|in/a.csv|12|9", 12L, 9L).hasIdentity());
+    }
+
+    /**
+     * Refused rather than truncated, for the same reason a seed's is: a truncated identity compares
+     * equal to a different source, which is a silent wrong resume rather than a loud failure.
+     */
+    @Test
+    public void anOverlongIdentityIsRefused() {
+        String tooLong = "x".repeat(StreamSeed.MAX_IDENTITY_CHARS + 1);
+
+        assertRejected(() -> new SourceIdentity(tooLong, 1L, 1L), "hash it down");
+    }
+
+    /** Measurements are optional; a source that can name a resource but not size it is normal. */
+    @Test
+    public void unknownMeasurementsAreNormalised() {
+        SourceIdentity named = SourceIdentity.of("conn1|in/a.csv");
+
+        assertEquals(StreamSeed.UNKNOWN, named.size());
+        assertEquals(StreamSeed.UNKNOWN, named.lastModified());
+        assertTrue(named.hasIdentity());
+        assertEquals(StreamSeed.UNKNOWN, new SourceIdentity("x", -5L, -1L).size());
+    }
+
+    /** Five states, and the two questions the framework actually asks of them. */
+    @Test
+    public void transferStatusesKnowWhichAreTerminalAndWhichOccupyTheQueue() {
+        assertTrue(TransferStatus.QUEUED.isInFlight());
+        assertTrue(TransferStatus.RUNNING.isInFlight());
+        assertFalse(TransferStatus.DONE.isInFlight());
+
+        assertTrue(TransferStatus.DONE.isTerminal());
+        assertTrue(TransferStatus.FAILED.isTerminal());
+        assertTrue(TransferStatus.CANCELLED.isTerminal());
+        assertFalse(TransferStatus.QUEUED.isTerminal());
+    }
+
+    /**
+     * The run's name is derived from the job id and nothing else, which is what lets a second attempt
+     * land in the workspace the first one left.
+     */
+    @Test
+    public void aTransfersRunNameIsDerivedFromItsJobId() {
+        Transfer transfer = new Transfer(1423L, "mft-queue", Map.of("path", "in/a.csv"), "QUEUED", 0,
+                0L, null, null, null, null, 0L, 0L, 0L);
+
+        assertEquals("mft-job-1423", transfer.runName());
+        assertEquals("in/a.csv", transfer.parameter("path"));
+    }
+
+    /**
+     * The parameters outlive the caller that supplied them — they are written to a row and read back by
+     * another node — so a transfer must not share a map anyone else can still change.
+     */
+    @Test
+    public void aTransfersParametersAreItsOwnAndUnmodifiable() {
+        Map<String, String> supplied = new HashMap<>();
+        supplied.put("path", "in/a.csv");
+        Transfer transfer = new Transfer(1L, "mft-queue", supplied, "QUEUED", 0, 0L, null, null, null,
+                null, 0L, 0L, 0L);
+
+        supplied.put("path", "in/b.csv");
+        assertEquals("a later edit by the caller must not change the transfer",
+                "in/a.csv", transfer.parameter("path"));
+
+        try {
+            transfer.parameters().put("connection", "conn2");
+            fail("a transfer's parameters must not be modifiable");
+        } catch (UnsupportedOperationException expected) {
+            // the point
+        }
     }
 
     // ---------- helper ----------

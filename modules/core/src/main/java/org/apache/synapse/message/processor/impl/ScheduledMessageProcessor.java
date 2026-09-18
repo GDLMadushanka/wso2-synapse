@@ -29,6 +29,7 @@ import org.apache.synapse.message.processor.MessageProcessorConstants;
 import org.apache.synapse.message.processor.impl.failover.FailoverForwardingService;
 import org.apache.synapse.message.processor.impl.forwarder.ForwardingProcessorConstants;
 import org.apache.synapse.message.processor.impl.forwarder.ForwardingService;
+import org.apache.synapse.message.processor.impl.mft.MFTTransferService;
 import org.apache.synapse.message.processor.impl.sampler.SamplingService;
 import org.apache.synapse.message.senders.blocking.BlockingMsgSender;
 import org.apache.synapse.registry.Registry;
@@ -454,6 +455,8 @@ public abstract class ScheduledMessageProcessor extends AbstractMessageProcessor
 				((ForwardingService) task).resetTerminated();
 			} else if (task instanceof FailoverForwardingService) {
 				((FailoverForwardingService) task).resetTerminated();
+			} else if (task instanceof MFTTransferService) {
+				((MFTTransferService) task).resetTerminated();
 			}
 		}
 		for (int i = 0; i < memberCount; i++) {
@@ -649,6 +652,11 @@ public abstract class ScheduledMessageProcessor extends AbstractMessageProcessor
 				((SamplingService) task).terminate();
 			} else if (task instanceof FailoverForwardingService) {
 				((FailoverForwardingService) task).terminate();
+			} else if (task instanceof MFTTransferService) {
+				// Required, not optional: a Task this chain does not recognise is skipped with no log
+				// and no exception, so an MFT processor would simply not stop when asked and would keep
+				// claiming transfers after a pause.
+				((MFTTransferService) task).terminate();
 			}
 		}
 	}
@@ -685,6 +693,8 @@ public abstract class ScheduledMessageProcessor extends AbstractMessageProcessor
 				((ForwardingService) task).resetTerminated();
 			} else if (task instanceof FailoverForwardingService) {
 				((FailoverForwardingService) task).resetTerminated();
+			} else if (task instanceof MFTTransferService) {
+				((MFTTransferService) task).resetTerminated();
 			}
 		}
 	}

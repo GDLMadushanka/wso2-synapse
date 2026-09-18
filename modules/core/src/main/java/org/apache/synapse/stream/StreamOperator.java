@@ -120,7 +120,44 @@ public interface StreamOperator {
             throws StreamException {
     }
 
+    /**
+     * Whether this operator produces <b>byte-identical output for byte-identical input</b>.
+     *
+     * <p>Strictly that, and not "logically equivalent". The framework uses it for one thing: a stage
+     * that {@link #checkpointed()} may only sit below a {@link #materialises()} stage that is
+     * deterministic, because a failure re-derives the materialising stage's unpersisted tail and, if
+     * that tail may differ, the checkpointed stage's recorded position would skip records of different
+     * bytes — silently, and undetectably afterwards (ADR-0034).
+     *
+     * <p>So a wrong {@code true} does not fail a transfer. It produces a plausible, complete, wrong
+     * output file. {@code false} costs a re-run; there is no symmetric cost to being wrong the other
+     * way, which is why the default is {@code false} and why an operator that cannot be sure must
+     * leave it alone.
+     */
     default boolean deterministic() {
+        return false;
+    }
+
+    /**
+     * Whether the answer to {@link #deterministic()} belongs to the <b>deployer</b> rather than to this
+     * operator.
+     *
+     * <p>For most operators it does not: what they do is fixed in their own code, so they can answer,
+     * and a deployer asserting otherwise would be overriding a fact with a guess. But an operator whose
+     * output is produced by <i>deployer-supplied configuration</i> genuinely cannot answer — a
+     * per-record loop that runs a named sequence emits whatever that sequence emits, and the sequence
+     * may call a backend, read a clock or generate an id. The operator sees a name; the deployer wrote
+     * the mediators.
+     *
+     * <p>Declaring this lets a {@code deterministic="true|false"} stage attribute settle it, and the
+     * attribute is <b>refused at deployment on any operator that does not</b> — so the choice is
+     * offered exactly where someone is in a position to make it. The same question ADR-0025 settled for
+     * {@code maxReprocessed}: not "is this configurable" but "who can possibly know".
+     *
+     * <p>Declaring it changes nothing on its own. With no attribute, {@link #deterministic()} still
+     * decides.
+     */
+    default boolean defersDeterminismToDeployer() {
         return false;
     }
 
