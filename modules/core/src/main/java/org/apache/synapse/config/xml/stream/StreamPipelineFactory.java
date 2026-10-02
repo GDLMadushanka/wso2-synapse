@@ -74,7 +74,7 @@ public class StreamPipelineFactory {
      * know this list.
      */
     private static final Set<String> RESERVED_STAGE_ATTRIBUTES =
-            Set.of("materialize", "maxReprocessed", "deterministic");
+            Set.of("materialize", "maxReprocessed", "checkpointEvery", "deterministic");
 
     private static final QName DESCRIPTION_ELT =
             new QName(XMLConfigConstants.SYNAPSE_NAMESPACE, "description");
@@ -295,6 +295,61 @@ public class StreamPipelineFactory {
     }
 
     /**
+     * Parses {@code checkpointEvery}, the cadence for a stage that counts in bytes.
+     *
+     * <p>Accepts a plain byte count or a size suffix — {@code 512KB}, {@code 32MB}, {@code 1GB}, and the
+     * binary spellings {@code KiB}/{@code MiB}/{@code GiB}. Both families are read as powers of 1024,
+     * which is what every other size in this feature means and what a deployer sizing a buffer expects;
+     * the decimal reading would differ by 7% at GB and surprise nobody usefully.
+     *
+     * <p>Refused below 1, for the same reason {@code maxReprocessed} is: a failure always costs at least
+     * the work in flight, so a bound of zero describes nothing achievable.
+     */
+    private static Long parseCheckpointEvery(String pipelineName, int index, String stage,
+                                             String value) {
+        if (value == null) {
+            return null;
+        }
+        String text = value.trim();
+        long multiplier = 1L;
+        String[][] suffixes = {{"KIB", "1024"}, {"MIB", "1048576"}, {"GIB", "1073741824"},
+                               {"KB", "1024"}, {"MB", "1048576"}, {"GB", "1073741824"},
+                               {"K", "1024"}, {"M", "1048576"}, {"G", "1073741824"}, {"B", "1"}};
+        String upper = text.toUpperCase(java.util.Locale.ROOT);
+        for (String[] suffix : suffixes) {
+            if (upper.endsWith(suffix[0])) {
+                multiplier = Long.parseLong(suffix[1]);
+                text = text.substring(0, text.length() - suffix[0].length()).trim();
+                break;
+            }
+        }
+        long parsed;
+        try {
+            parsed = Long.parseLong(text);
+        } catch (NumberFormatException e) {
+            throw new SynapseException("stream pipeline '" + pipelineName + "' operator " + index
+                    + " has 'checkpointEvery=\"" + value + "\"'; expected a size in bytes, optionally"
+                    + " suffixed KB/MB/GB or KiB/MiB/GiB");
+        }
+        if (parsed < 1) {
+            throw new SynapseException("stream pipeline '" + pipelineName + "' operator " + index
+                    + " has 'checkpointEvery=\"" + value + "\"'; it must be at least 1 byte, since a"
+                    + " failure always costs at least the work in flight");
+        }
+        long bytes = parsed * multiplier;
+        if (bytes / multiplier != parsed) {
+            throw new SynapseException("stream pipeline '" + pipelineName + "' operator " + index
+                    + " has 'checkpointEvery=\"" + value + "\"', which overflows a long");
+        }
+        if (log.isInfoEnabled()) {
+            log.info("Stream pipeline '" + pipelineName + "' operator " + index + " ('" + stage
+                    + "') is configured with checkpointEvery=" + bytes + " bytes. Applies only where"
+                    + " the stage counts in BYTES; a stage counting in units takes maxReprocessed.");
+        }
+        return bytes;
+    }
+
+    /**
      * Builds and adds every operator, in chain order.
      *
      * <p>Runs either at parse time or, for a pipeline whose operators come from a connector, from
@@ -319,6 +374,8 @@ public class StreamPipelineFactory {
             rejectUnhonouredMaterialize(pipeline.getName(), index,
                     takeReservedAttribute(childElem, "materialize"));
             String maxReprocessedAttr = takeReservedAttribute(childElem, "maxReprocessed");
+            Long checkpointEveryAttr = parseCheckpointEvery(pipeline.getName(), index,
+                    stageLabel(childElem), takeReservedAttribute(childElem, "checkpointEvery"));
             Boolean deterministicAttr = parseDeterministic(pipeline.getName(), index,
                     stageLabel(childElem), takeReservedAttribute(childElem, "deterministic"));
 
@@ -337,7 +394,7 @@ public class StreamPipelineFactory {
                 }
                 pipeline.addOperator(operator, nameIsExplicit,
                         parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
-                                maxReprocessedAttr), deterministicAttr);
+                                maxReprocessedAttr), deterministicAttr, checkpointEveryAttr);
                 index++;
                 continue;
             }
@@ -359,11 +416,11 @@ public class StreamPipelineFactory {
                 pipeline.addOperation(invoke, childElem.getLocalName(),
                         nameAttr == null ? null : nameAttr.getAttributeValue(), nameIsExplicit,
                         parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
-                                maxReprocessedAttr), deterministicAttr);
+                                maxReprocessedAttr), deterministicAttr, checkpointEveryAttr);
             } else if (mediator instanceof StreamOperator operator) {
                 pipeline.addOperator(operator, nameIsExplicit,
                         parseMaxReprocessed(pipeline.getName(), index, stageLabel(childElem),
-                                maxReprocessedAttr), deterministicAttr);
+                                maxReprocessedAttr), deterministicAttr, checkpointEveryAttr);
             } else {
                 throw new StreamException("<" + childElem.getLocalName() + "> at position " + index
                         + " is not a stream operator. A pipeline stage must be a registered stream"

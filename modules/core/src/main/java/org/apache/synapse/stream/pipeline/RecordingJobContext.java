@@ -21,6 +21,7 @@ package org.apache.synapse.stream.pipeline;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.stream.JobContext;
+import org.apache.synapse.stream.StreamSeed;
 import org.apache.synapse.stream.JobStore;
 import org.apache.synapse.stream.StreamShutdown;
 
@@ -81,6 +82,12 @@ final class RecordingJobContext implements JobContext {
      * obtain again, so it gets the same contract as any other in-flight mediation. See ADR-0037.
      */
     private final boolean stopsOnShutdown;
+
+    /**
+     * What the source said its size was, remembered so {@link #expectedSize()} can answer with it.
+     * Written once during the build, before any stage runs, and read by stages thereafter.
+     */
+    private volatile long sourceSize = StreamSeed.UNKNOWN;
 
     RecordingJobContext(JobContext delegate, JobStore store, String runId) {
         this(delegate, store, runId, false);
@@ -228,11 +235,24 @@ final class RecordingJobContext implements JobContext {
 
     @Override
     public Long expectedSize() {
-        return delegate.expectedSize();
+        // The caller's own answer wins: a submitter that declared a Content-Length knows something the
+        // probe does not. Otherwise fall back to what the source reported when it was identified.
+        //
+        // These are the same quantity -- sourceOpened's size IS the total expected byte count -- but
+        // they were never connected, so a pipeline that opened its own source answered null here for
+        // every stage. An operator that sizes its work from the source could not, and silently used a
+        // default instead.
+        Long declared = delegate.expectedSize();
+        if (declared != null) {
+            return declared;
+        }
+        long probed = sourceSize;
+        return probed == StreamSeed.UNKNOWN || probed < 0 ? null : probed;
     }
 
     @Override
     public void sourceOpened(long size, long lastModified) {
+        this.sourceSize = size;
         delegate.sourceOpened(size, lastModified);
     }
 

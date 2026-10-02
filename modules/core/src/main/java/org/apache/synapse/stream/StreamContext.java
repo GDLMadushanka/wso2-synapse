@@ -216,6 +216,22 @@ public interface StreamContext {
      *
      * @return at least 1
      */
+    /**
+     * The byte offset at which this stage's upstream stream begins. Zero unless a resume moved it.
+     *
+     * <p><b>One number, read by both ends</b>, which is what keeps them from disagreeing. A seekable
+     * source starts here. A sink skips {@code itsOwnResumePosition - upstreamStartsAt()}, which is
+     * naturally zero when the source honoured the offset and the full prefix when it did not — so the
+     * same code is correct either way and no second flag has to be kept in step.
+     *
+     * <p>The framework only moves it when every stage between source and sink preserves byte offsets.
+     * Today that means a chain of exactly two: a transform that changes volume makes the source's
+     * offsets and the sink's unrelated, and pushing one then would corrupt the output silently.
+     */
+    default long upstreamStartsAt() {
+        return 0L;
+    }
+
     default int maxReprocessed() {
         return 1;
     }

@@ -165,6 +165,13 @@ public class StreamPipeline implements ManagedLifecycle {
     private final List<Integer> maxReprocessed = new ArrayList<>();
 
     /**
+     * Per-stage checkpoint cadence in <b>bytes</b>; {@code null} means "use the default". Set from the
+     * {@code checkpointEvery} stage attribute, and consulted only for a stage whose checkpoint unit is
+     * {@code BYTES} — where a bound is a size and a count of units would be meaningless.
+     */
+    private final List<Long> checkpointEvery = new ArrayList<>();
+
+    /**
      * Per stage: the deployer's {@code deterministic} attribute, or {@code null} for "ask the
      * operator". Only consulted for an operator that declares
      * {@link StreamOperator#defersDeterminismToDeployer()}; set on any other, it is refused at
@@ -877,6 +884,14 @@ public class StreamPipeline implements ManagedLifecycle {
         // as litter.
         JobStore store;
         Path runDir;
+        // Carried out of the probe so the build below can report it. identify() is the only thing that
+        // knows how large the source is before a byte moves, and until this was hoisted the answer was
+        // discarded: sourceOpened() below was fed from the seed alone, so a pipeline that opens its own
+        // source told every stage UNKNOWN. An operator that sizes its work from the source -- a blob
+        // sink choosing a block size against Azure's 50,000-block ceiling, say -- was therefore always
+        // sizing blind.
+        long probedSize = StreamSeed.UNKNOWN;
+        long probedLastModified = StreamSeed.UNKNOWN;
         // Nothing here moves a byte, but the probe was handed the scope, so anything it registered is
         // this block's to release: the try/finally that normally does it does not start until the
         // build below, and a failure before then would otherwise leave a connection open with no
@@ -900,6 +915,11 @@ public class StreamPipeline implements ManagedLifecycle {
                     identified == null ? StreamSeed.UNKNOWN : identified.lastModified()));
 
             runDir = guardSourceIdentity(prior, identified, runId, runDir);
+
+            if (identified != null) {
+                probedSize = identified.size();
+                probedLastModified = identified.lastModified();
+            }
         } catch (StreamException | RuntimeException | Error e) {
             resources.abort();
             throw e;
@@ -950,12 +970,20 @@ public class StreamPipeline implements ManagedLifecycle {
             List<OperatorEntry.Resolution> resolved = resolveForRun();
             OperatorEntry.Resolution sinkResolution = null;
 
+            // Decided before anything opens, because the source has to be told where to start and only
+            // the sink knows where that is. Zero unless every condition in resumeOffsetFor holds.
+            long upstreamOffset = resumeOffsetFor(resolved, msg, jobCtx, resources, runId.value(), runDir);
+
             for (int i = 0; i < resolved.size(); i++) {
                 OperatorEntry.Resolution resolution = resolved.get(i);
                 StreamOperator op = resolution.operator();
                 String stage = stageNameAt(i, op);
                 DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, op, stage, runId.value(),
-                        runDir, maxReprocessed(i));
+                        runDir, maxReprocessed(i), checkpointEvery(i));
+                // Both ends read the same number: the source starts there, the sink skips the
+                // difference between there and its own position — which is zero when the source
+                // honoured it. One value, so the two cannot disagree.
+                ctx.upstreamStartsAt(upstreamOffset);
                 contexts.add(ctx);
 
                 if (op instanceof StreamSink s) {
@@ -1057,8 +1085,12 @@ public class StreamPipeline implements ManagedLifecycle {
                 stages.add(below);
             }
 
-            jobCtx.sourceOpened(seed == null ? StreamSeed.UNKNOWN : seed.size(),
-                    seed == null ? StreamSeed.UNKNOWN : seed.lastModified());
+            // The seed when a caller supplied one, otherwise whatever the source said about itself
+            // when it was identified. Reported here, during the build, rather than left to the source
+            // to announce on its first read: this is a pull pipeline, so the sink's consume() -- and
+            // any expectedSize() it reads -- runs before the first read() ever reaches the source.
+            jobCtx.sourceOpened(seed != null ? seed.size() : probedSize,
+                    seed != null ? seed.lastModified() : probedLastModified);
 
             // ---- phase 2: pull. Everything happens here. ----------------------------------
             if (sink != null) {
@@ -1317,7 +1349,7 @@ public class StreamPipeline implements ManagedLifecycle {
         // No workspace. Identifying a resource is not a reason to create a stage directory, and a probe
         // that wrote an artifact would be writing before the run was recorded.
         DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, resolution.operator(), stage,
-                runId, null, maxReprocessed(0));
+                runId, null, maxReprocessed(0), checkpointEvery(0));
 
         // Bound exactly as the build loop binds it: a connector operation reads its configuration --
         // which connection, which path -- from the message, and identifying a resource needs the same
@@ -1489,9 +1521,76 @@ public class StreamPipeline implements ManagedLifecycle {
         }
     }
 
+    /**
+     * Where a resumed run's source should start reading, or {@code 0} to start at the beginning.
+     *
+     * <p>Without this a resumed transfer re-reads everything it already wrote and throws it away. At
+     * 500 GB with a failure at 450 that is hours of network for no output, over a source the framework
+     * could have skipped.
+     *
+     * <p><b>Every condition here is load-bearing.</b>
+     *
+     * <ol>
+     *   <li><b>Exactly two stages.</b> The offset is a byte position in the source, and the sink's
+     *       position is a byte position in its own output. Those are the same number only while
+     *       nothing between them changes volume. A transform makes them unrelated, and pushing an
+     *       offset then would start the source in the wrong place with nothing to detect it. A
+     *       general rule would need every intervening stage to declare that it preserves offsets;
+     *       two stages needs no declaration from anyone.</li>
+     *   <li><b>The source says it can seek.</b> A source that ignores the offset while claiming
+     *       {@code seekable()} produces output missing its prefix, because the sink will have skipped
+     *       nothing on the strength of the same promise.</li>
+     *   <li><b>The sink offers a byte offset.</b> {@code -1} means it cannot say, and the run then
+     *       behaves exactly as before — correct, and slower.</li>
+     * </ol>
+     *
+     * <p>The sink is asked with its parameters bound, the same way {@code identify()} is, because a
+     * connector operation reads which container or path it is writing to from the message and cannot
+     * answer without it.
+     */
+    private long resumeOffsetFor(List<OperatorEntry.Resolution> resolved, MessageContext msg,
+                                 JobContext jobCtx, ResourceScope resources, String runId,
+                                 Path runDir) {
+        if (resolved.size() != 2) {
+            return 0L;
+        }
+        if (!(resolved.get(0).operator() instanceof StreamSource src) || !src.seekable()) {
+            return 0L;
+        }
+        OperatorEntry.Resolution sinkResolution = resolved.get(1);
+        if (!(sinkResolution.operator() instanceof StreamSink sink)) {
+            return 0L;
+        }
+
+        String stage = stageNameAt(1, sinkResolution.operator());
+        DefaultStreamContext ctx = contextFor(msg, jobCtx, resources, sinkResolution.operator(), stage,
+                runId, runDir, maxReprocessed(1), checkpointEvery(1));
+        boolean bound = sinkResolution.bind(msg);
+        try {
+            long offset = sink.durableByteOffset(ctx);
+            if (offset <= 0) {
+                return 0L;
+            }
+            log.info("stream pipeline '" + name + "' run '" + runId + "': stage '" + stage
+                    + "' resumes at byte " + offset + ", and the source can seek, so those bytes are"
+                    + " skipped rather than re-read and discarded");
+            return offset;
+        } catch (IOException | RuntimeException e) {
+            // Never fatal: not knowing where to resume costs a re-read, which is slow and correct.
+            log.warn("stream pipeline '" + name + "' could not ask stage '" + stage + "' where it"
+                    + " resumes, so the source starts from the beginning: " + e.getMessage());
+            return 0L;
+        } finally {
+            if (bound) {
+                sinkResolution.release(msg);
+            }
+        }
+    }
+
     private DefaultStreamContext contextFor(MessageContext msg, JobContext job,
                                             ResourceScope resources, StreamOperator op, String stage,
-                                            String runId, Path runDir, int maxReprocessed) {
+                                            String runId, Path runDir, int maxReprocessed,
+                                            Long checkpointEvery) {
         boolean mayUseWorkspace = op.materialises() || op.checkpointed();
         Path stageDir = (mayUseWorkspace && runDir != null) ? runDir.resolve(stage) : null;
 
@@ -1502,7 +1601,8 @@ public class StreamPipeline implements ManagedLifecycle {
                 : null;
 
         return new DefaultStreamContext(msg, job, resources, stage, mayUseWorkspace,
-                op.checkpointed(), stageDir, store, maxReprocessed, scratchTarget(stage, runId, runDir));
+                op.checkpointed(), stageDir, store, maxReprocessed, checkpointEvery,
+                scratchTarget(stage, runId, runDir));
     }
 
     /**
@@ -1818,6 +1918,15 @@ public class StreamPipeline implements ManagedLifecycle {
      */
     public void addOperator(StreamOperator op, boolean nameIsExplicit, Integer maxReprocessed,
                             Boolean deterministic) {
+        addOperator(op, nameIsExplicit, maxReprocessed, deterministic, null);
+    }
+
+    /**
+     * @param checkpointEvery the deployer's {@code checkpointEvery} in bytes, or {@code null}. Applies
+     *                        only where the stage counts in {@code BYTES}
+     */
+    public void addOperator(StreamOperator op, boolean nameIsExplicit, Integer maxReprocessed,
+                            Boolean deterministic, Long checkpointEvery) {
         if (op == null) {
             throw new IllegalArgumentException("cannot add a null operator to pipeline '" + name + "'");
         }
@@ -1840,6 +1949,7 @@ public class StreamPipeline implements ManagedLifecycle {
         stageNames.add(operatorName);
         this.maxReprocessed.add(maxReprocessed);
         this.deterministic.add(deterministic);
+        this.checkpointEvery.add(checkpointEvery);
     }
 
     /**
@@ -1869,6 +1979,16 @@ public class StreamPipeline implements ManagedLifecycle {
     public void addOperation(org.apache.synapse.mediators.template.InvokeMediator invoke,
                              String elementName, String stageName, boolean nameIsExplicit,
                              Integer maxReprocessed, Boolean deterministic) {
+        addOperation(invoke, elementName, stageName, nameIsExplicit, maxReprocessed, deterministic,
+                null);
+    }
+
+    /**
+     * @param checkpointEvery the deployer's {@code checkpointEvery} in bytes, or {@code null}
+     */
+    public void addOperation(org.apache.synapse.mediators.template.InvokeMediator invoke,
+                             String elementName, String stageName, boolean nameIsExplicit,
+                             Integer maxReprocessed, Boolean deterministic, Long checkpointEvery) {
         if (invoke == null) {
             throw new IllegalArgumentException("cannot add a null operation to pipeline '" + name + "'");
         }
@@ -1877,6 +1997,7 @@ public class StreamPipeline implements ManagedLifecycle {
         stageNames.add(stageName == null || stageName.trim().isEmpty() ? elementName : stageName.trim());
         this.maxReprocessed.add(maxReprocessed);
         this.deterministic.add(deterministic);
+        this.checkpointEvery.add(checkpointEvery);
     }
 
     /**
@@ -2046,6 +2167,18 @@ public class StreamPipeline implements ManagedLifecycle {
     public int maxReprocessed(int index) {
         Integer configured = maxReprocessed.get(index);
         return configured != null ? configured : 1;
+    }
+
+    /**
+     * The deployer's {@code checkpointEvery} for stage {@code index}, in bytes, or {@code null} for the
+     * default.
+     *
+     * <p>Null rather than a number, because the default belongs to the artifact and not here: only the
+     * artifact knows the stage's unit, and for anything but {@code BYTES} this value does not apply at
+     * all.
+     */
+    public Long checkpointEvery(int index) {
+        return index < 0 || index >= checkpointEvery.size() ? null : checkpointEvery.get(index);
     }
 
     /**

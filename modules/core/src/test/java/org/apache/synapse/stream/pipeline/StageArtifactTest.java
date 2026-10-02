@@ -249,6 +249,90 @@ public class StageArtifactTest {
         assertEquals(2000L, store.written.get(1).position());
     }
 
+    // ------------------------------------------------------ cadence by unit (ADR-0056)
+
+    /**
+     * The unit picks the attribute. A byte stage that configures nothing must not inherit the count's
+     * cautious default of 1, which in bytes asks for an fsync per byte and is achievable by nobody.
+     */
+    @Test
+    public void aByteStageTakesTheByteDefaultAndNotTheCountOfOne() throws Exception {
+        Path dir = stageDir();
+        RecordingStore store = new RecordingStore(partialOf(dir));
+        ResourceScope scope = new ResourceScope();
+        StageArtifact artifact = bytes(dir, store, 1, null, scope);
+
+        // Three reports of 4 MiB: 4 and 8 are below and at the 8 MiB default, 12 is past it.
+        artifact.unitDone(4L * 1024 * 1024);
+        artifact.unitDone(8L * 1024 * 1024);
+        artifact.unitDone(12L * 1024 * 1024);
+        scope.close();
+
+        assertEquals("one checkpoint, at the first report that reached 8 MiB",
+                1, store.written.size());
+        assertEquals(8L * 1024 * 1024, store.written.get(0).position());
+    }
+
+    /** And the deployer can size it, in the unit they are actually thinking in. */
+    @Test
+    public void checkpointEverySizesAByteStage() throws Exception {
+        Path dir = stageDir();
+        RecordingStore store = new RecordingStore(partialOf(dir));
+        ResourceScope scope = new ResourceScope();
+        StageArtifact artifact = bytes(dir, store, 1, 1024L * 1024, scope);
+
+        for (int mib = 1; mib <= 4; mib++) {
+            artifact.unitDone((long) mib * 1024 * 1024);
+        }
+        scope.close();
+
+        assertEquals("4 MiB at a 1 MiB cadence is four checkpoints", 4, store.written.size());
+        assertEquals(4L * 1024 * 1024, store.written.get(3).position());
+    }
+
+    /**
+     * maxReprocessed on a byte stage is ignored rather than honoured. It would otherwise mean "at most
+     * N bytes", which is not a bound anybody sets deliberately and which silently widens or narrows the
+     * cadence depending on which attribute the deployer happened to reach for.
+     */
+    @Test
+    public void maxReprocessedIsIgnoredOnAByteStage() throws Exception {
+        Path dir = stageDir();
+        RecordingStore store = new RecordingStore(partialOf(dir));
+        ResourceScope scope = new ResourceScope();
+        StageArtifact artifact = bytes(dir, store, 4096, null, scope);
+
+        artifact.unitDone(1024L * 1024);
+        scope.close();
+
+        assertEquals("1 MiB is past maxReprocessed=4096 but short of the 8 MiB byte default",
+                0, store.written.size());
+    }
+
+    /** Symmetrically: a record stage ignores checkpointEvery and keeps its count. */
+    @Test
+    public void checkpointEveryIsIgnoredOnARecordStage() throws Exception {
+        Path dir = stageDir();
+        RecordingStore store = new RecordingStore(partialOf(dir));
+        ResourceScope scope = new ResourceScope();
+        StageArtifact artifact = new DefaultStageArtifact("stage", dir, "artifact.out", store,
+                CheckpointUnit.RECORDS, VERSION, 2, 8L * 1024 * 1024, scope, () -> { }, true);
+
+        for (int record = 1; record <= 4; record++) {
+            append(artifact, "x");
+            artifact.unitDone(record);
+        }
+        scope.close();
+
+        assertEquals("four records at a bound of two records", 2, store.written.size());
+    }
+
+    private DefaultStageArtifact bytes(Path dir, CheckpointStore store, int maxReprocessed,
+                                       Long checkpointEvery, ResourceScope scope) {
+        return new DefaultStageArtifact("stage", dir, "artifact.out", store, CheckpointUnit.BYTES,
+                VERSION, maxReprocessed, checkpointEvery, scope, () -> { }, true);
+    }
+
     /**
      * A coarse reporter is not punished with an fsync per byte.
      *
@@ -415,8 +499,11 @@ public class StageArtifactTest {
     @Test
     public void aCheckpointOnlyStageNeedsNoWorkspace() throws Exception {
         RecordingStore store = new RecordingStore(Path.of("/nonexistent"));
+        // Names its cadence because the unit is BYTES, where the bound is checkpointEvery and its
+        // default is 8 MiB (ADR-0056). This test is about a stage with no workspace, not about
+        // cadence, so it asks for the finest cadence there is and gets a checkpoint per report.
         StageArtifact artifact = new DefaultStageArtifact("upload", null, "artifact.out", store,
-                CheckpointUnit.BYTES, VERSION, 1, new ResourceScope(), () -> { }, true);
+                CheckpointUnit.BYTES, VERSION, 1, 1L, new ResourceScope(), () -> { }, true);
 
         assertFalse("nothing can be complete without a workspace", artifact.isComplete());
         assertEquals(0L, artifact.resumePosition());

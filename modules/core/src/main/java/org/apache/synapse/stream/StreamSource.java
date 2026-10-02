@@ -82,6 +82,26 @@ public interface StreamSource extends StreamOperator {
      *
      * @return whether these bytes can be obtained again; never {@code null}
      */
+    /**
+     * Whether this source can begin at a byte offset instead of at the start.
+     *
+     * <p>Declaring {@code true} is a promise that the source will honour
+     * {@link StreamContext#upstreamStartsAt()}: the first byte it delivers is the byte at that offset,
+     * and it delivers nothing before it. A source that ignores the offset while claiming this produces
+     * a transfer that is silently short — the sink believes the prefix was already written and appends
+     * the wrong bytes after it.
+     *
+     * <p>Cheap to honour for anything addressable by range: a file seeks, a blob asks for
+     * {@code bytes=N-}. Impossible for a stream that arrives once, which is why the default is false
+     * and why a source must opt in rather than be assumed.
+     *
+     * <p>What it buys: a resumed transfer that skips the prefix rather than re-reading and discarding
+     * it. At 500 GB with a failure at 450, the difference is hours of network for no output.
+     */
+    default boolean seekable() {
+        return false;
+    }
+
     default StreamOrigin origin() {
         return StreamOrigin.REOPENABLE;
     }

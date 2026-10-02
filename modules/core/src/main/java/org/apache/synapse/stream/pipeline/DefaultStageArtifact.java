@@ -76,6 +76,26 @@ public class DefaultStageArtifact implements StageArtifact {
     private final String formatVersion;
 
     private final int maxReprocessed;
+
+    /**
+     * Checkpoint cadence for a {@code BYTES} stage when the deployer configured none.
+     *
+     * <p>Chosen to leave existing deployments exactly where they were rather than to be optimal: the
+     * only byte sink reports at this cadence today, so a pipeline that configures nothing checkpoints
+     * at the same points before and after this split. Tuning is a deployer's to do, visibly.
+     */
+    public static final long DEFAULT_CHECKPOINT_BYTES = 8L * 1024 * 1024;
+
+    /** The deployer's {@code checkpointEvery}, in bytes, or {@code null} for the default. */
+    private final Long checkpointEvery;
+
+    /**
+     * How far the position must advance before a checkpoint is due, in this stage's own unit.
+     *
+     * <p>Resolved once from the unit, because the two units answer different questions and only one of
+     * them is about duplicates. See {@link #resolveThreshold}.
+     */
+    private final long threshold;
     private final ResourceScope resources;
 
     /** Signals the owning context that this stage short-circuited; the pipeline reads it after the build. */
@@ -133,6 +153,14 @@ public class DefaultStageArtifact implements StageArtifact {
                                 CheckpointStore store, CheckpointUnit unit, String formatVersion,
                                 int maxReprocessed, ResourceScope resources, Runnable resumeSignal,
                                 boolean canonical) {
+        this(stageName, stageDir, artifactName, store, unit, formatVersion, maxReprocessed, null,
+                resources, resumeSignal, canonical);
+    }
+
+    public DefaultStageArtifact(String stageName, Path stageDir, String artifactName,
+                                CheckpointStore store, CheckpointUnit unit, String formatVersion,
+                                int maxReprocessed, Long checkpointEvery, ResourceScope resources,
+                                Runnable resumeSignal, boolean canonical) {
         this.stageName = stageName;
         // Null when no workspace is configured, which is legal for a stage that keeps a position and
         // writes nothing. Appending then fails with a message naming the cause; checkpointing does not.
@@ -142,6 +170,8 @@ public class DefaultStageArtifact implements StageArtifact {
         this.unit = unit;
         this.formatVersion = formatVersion;
         this.maxReprocessed = Math.max(1, maxReprocessed);
+        this.checkpointEvery = checkpointEvery;
+        this.threshold = resolveThreshold(stageName, unit, this.maxReprocessed, checkpointEvery);
         this.resources = resources;
         this.resumeSignal = resumeSignal;
         this.canonical = canonical;
@@ -365,6 +395,57 @@ public class DefaultStageArtifact implements StageArtifact {
         unitDone(position, null);
     }
 
+    /**
+     * How far this stage must advance before a checkpoint is due, in its own unit.
+     *
+     * <p><b>The unit decides which attribute applies</b>, because the two answer different questions.
+     *
+     * <p>{@code RECORDS} is a count of discrete pieces of work, and for the one operator that hands
+     * control to a deployer's sequence a reprocessed record means a <b>repeated side effect</b> —
+     * a re-sent request, a re-inserted row. That exposure is the deployer's alone to size, which is
+     * what {@code maxReprocessed} is and why its default is the cautious 1 (ADR-0025).
+     *
+     * <p>{@code BYTES} has no such exposure. A byte sink writes into a staged artifact that nothing
+     * outside the run can see before commit (invariant 5), and resume truncates or overwrites the same
+     * offsets, so re-processing a byte is unobservable to anybody. There is no duplicate window to
+     * widen — only bandwidth to re-spend — so the cautious count is guarding a harm that cannot occur
+     * while costing an fsync per byte. {@code checkpointEvery} sizes that re-spend instead.
+     *
+     * <p>ADR-0025 is not overturned by this; it predates the case. It was decided when every
+     * checkpointed operator was a mediating {@code forEach} in {@code RECORDS}, and a byte-unit
+     * operator existed nowhere. Its rule still governs every stage whose reprocessing is visible.
+     *
+     * <p><b>The boundary this accepts:</b> a future {@code BYTES} sink with effects outside the run
+     * would get the byte cadence and a wider duplicate window than its deployer asked for. No such
+     * operator exists, and a sink that cannot say where it got to and discard above it cannot be
+     * checkpointed at all — which is the same property stated from the other side.
+     */
+    private static long resolveThreshold(String stageName, CheckpointUnit unit, int maxReprocessed,
+                                         Long checkpointEvery) {
+        if (unit != CheckpointUnit.BYTES) {
+            // A null unit is a stage that keeps no position at all -- a plain materialising transform,
+            // or a named working file. Neither attribute applies, and saying so would be noise on a
+            // stage the deployer did not configure.
+            if (checkpointEvery != null && unit != null) {
+                log.warn("stage '" + stageName + "' is configured with checkpointEvery but counts in "
+                        + unit + ", where the bound is a number of units and not a size. Use"
+                        + " maxReprocessed instead; checkpointEvery is ignored here");
+            }
+            return maxReprocessed;
+        }
+        if (maxReprocessed > 1) {
+            log.warn("stage '" + stageName + "' is configured with maxReprocessed=" + maxReprocessed
+                    + " but counts in BYTES, where a bound is a size and not a count of units. Use"
+                    + " checkpointEvery instead; maxReprocessed is ignored here");
+        }
+        return checkpointEvery == null ? DEFAULT_CHECKPOINT_BYTES : checkpointEvery;
+    }
+
+    /** Names the attribute that governs this stage, so a warning points at the one that will work. */
+    private String cadenceAttribute() {
+        return unit == CheckpointUnit.BYTES ? "checkpointEvery" : "maxReprocessed";
+    }
+
     @Override
     public void unitDone(long position, String payload) throws IOException {
         if (store == null || unit == null) {
@@ -386,19 +467,19 @@ public class DefaultStageArtifact implements StageArtifact {
         lastPayload = payload;
 
         long advanced = position - lastCheckpointPosition;
-        if (advanced < maxReprocessed) {
+        if (advanced < threshold) {
             // Not due. The bytes appended since the last checkpoint are deliberately left un-synced:
             // resume truncates them away, so paying for them would buy nothing. This is the whole of
-            // why maxReprocessed is the only lever on throughput here.
+            // why the cadence attribute is the only lever on throughput here.
             return;
         }
 
-        if (advanced > maxReprocessed && !granularityWarned) {
+        if (advanced > threshold && !granularityWarned) {
             granularityWarned = true;
             log.warn("stage '" + stageName + "' reports progress every " + advanced + " " + unit
-                    + " but maxReprocessed is " + maxReprocessed + ", so a failure may reprocess more"
-                    + " than the configured bound. The operator's own reporting granularity is the"
-                    + " floor; lower maxReprocessed no further, or report more finely");
+                    + " but " + cadenceAttribute() + " is " + threshold + ", so a failure may reprocess"
+                    + " more than the configured bound. The operator's own reporting granularity is the"
+                    + " floor; lower " + cadenceAttribute() + " no further, or report more finely");
         }
 
         // 2. durable before the position moves. flush() alone reaches the page cache, and a file that

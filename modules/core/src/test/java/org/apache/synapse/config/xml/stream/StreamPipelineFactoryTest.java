@@ -34,6 +34,7 @@ import java.util.Properties;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -314,6 +315,81 @@ public class StreamPipelineFactoryTest {
         } catch (SynapseException e) {
             assertTrue(e.getMessage(), e.getMessage().contains("strict"));
         }
+    }
+
+    /** checkpointEvery is reserved too, so a factory that rejects unknown attributes still builds. */
+    @Test
+    public void stripsCheckpointEveryBeforeTheOperatorFactorySeesIt() throws Exception {
+        StreamPipeline p = build("<streamPipeline name=\"ingest\" " + NS + ">"
+                + "<test.classpathSource/>"
+                + "<test.classpathSink checkpointEvery=\"32MiB\"/>"
+                + "</streamPipeline>");
+
+        assertEquals(2, p.getOperators().size());
+        assertEquals(Long.valueOf(32L * 1024 * 1024), p.checkpointEvery(1));
+    }
+
+    /**
+     * Sizes are read as powers of 1024 whichever way they are spelled. A deployer sizing a transfer
+     * buffer means 1024, and every other size in this feature does too; the decimal reading of "MB"
+     * would differ by 5% and surprise nobody usefully.
+     */
+    @Test
+    public void readsEverySizeSuffixAsPowersOf1024() throws Exception {
+        assertEquals(Long.valueOf(4096L), checkpointEveryOf("4096"));
+        assertEquals(Long.valueOf(512L * 1024), checkpointEveryOf("512KB"));
+        assertEquals(Long.valueOf(512L * 1024), checkpointEveryOf("512KiB"));
+        assertEquals(Long.valueOf(32L * 1024 * 1024), checkpointEveryOf("32MB"));
+        assertEquals(Long.valueOf(32L * 1024 * 1024), checkpointEveryOf("32MiB"));
+        assertEquals(Long.valueOf(1024L * 1024 * 1024), checkpointEveryOf("1GB"));
+        assertEquals("case and spacing are a deployer's business, not a parse failure",
+                Long.valueOf(8L * 1024 * 1024), checkpointEveryOf(" 8mib "));
+    }
+
+    /** Nothing is configured is not the same as zero configured. */
+    @Test
+    public void anAbsentCheckpointEveryIsNullRatherThanZero() throws Exception {
+        StreamPipeline p = build("<streamPipeline name=\"ingest\" " + NS + ">"
+                + "<test.classpathSource/><test.classpathSink/></streamPipeline>");
+
+        assertNull("absent means 'use the default', which only the artifact knows",
+                p.checkpointEvery(1));
+    }
+
+    @Test
+    public void refusesACheckpointEveryThatIsNotASize() throws Exception {
+        for (String bad : new String[] {"soon", "32 megabytes", "-1", "0", "1.5MiB", ""}) {
+            try {
+                build("<streamPipeline name=\"ingest\" " + NS + ">"
+                        + "<test.classpathSource/>"
+                        + "<test.classpathSink checkpointEvery=\"" + bad + "\"/>"
+                        + "</streamPipeline>");
+                fail("expected checkpointEvery=\"" + bad + "\" to be refused");
+            } catch (SynapseException expected) {
+                assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("checkpointEvery"));
+            }
+        }
+    }
+
+    /** It round-trips for the same reason maxReprocessed must: the deployer wrote it down. */
+    @Test
+    public void keepsCheckpointEveryInTheSerializedForm() throws Exception {
+        StreamPipeline p = build("<streamPipeline name=\"ingest\" " + NS + ">"
+                + "<test.classpathSource/>"
+                + "<test.classpathSink checkpointEvery=\"32MiB\"/>"
+                + "</streamPipeline>");
+
+        String serialized = StreamPipelineSerializer.serializeStreamPipeline(null, p).toString();
+        assertTrue("checkpointEvery must survive a round trip: " + serialized,
+                serialized.contains("checkpointEvery=\"32MiB\""));
+    }
+
+    private Long checkpointEveryOf(String value) throws Exception {
+        return build("<streamPipeline name=\"ingest\" " + NS + ">"
+                + "<test.classpathSource/>"
+                + "<test.classpathSink checkpointEvery=\"" + value + "\"/>"
+                + "</streamPipeline>").checkpointEvery(1);
     }
 
     /**

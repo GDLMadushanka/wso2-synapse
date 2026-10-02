@@ -32,6 +32,12 @@ import org.apache.synapse.stream.StreamShutdown;
 import org.apache.synapse.stream.StreamSeed;
 import org.junit.Test;
 
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.synapse.stream.StreamSink;
+import org.apache.synapse.stream.StreamContext;
+import java.util.concurrent.atomic.AtomicLong;
+import org.apache.synapse.stream.StreamSource;
+import org.apache.synapse.stream.SourceIdentity;
 import java.io.ByteArrayInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -804,6 +810,179 @@ public class StreamPipelineTest {
 
         assertTrue("the orphaned upstream's handle must be released when the stage resumes, not at the"
                 + " end of a run that may last hours", src.closed.get());
+    }
+
+    /**
+     * A resumed run tells a seekable source where to start, instead of re-reading the prefix.
+     *
+     * <p>Both ends read the same number, which is the point: the source begins at
+     * {@code upstreamStartsAt()}, and the sink skips its own position minus that — naturally zero when
+     * the source honoured it. A second flag kept in step would be a way for them to disagree, and a
+     * resume that skips twice or not at all corrupts silently.
+     */
+    @Test
+    public void aResumedRunStartsASeekableSourceAtTheSinksOffset() throws Exception {
+        byte[] data = "0123456789abcdefghijklmnopqrstuvwxyz".getBytes(StandardCharsets.UTF_8);
+        AtomicLong sourceToldToStartAt = new AtomicLong(-1);
+        AtomicLong sinkSawUpstreamAt = new AtomicLong(-1);
+
+        JobStores.register(pipelineName -> new JobStore() {
+            @Override
+            public JobRecord start(JobRun run) {
+                return null;
+            }
+        });
+        try {
+            Path root = Files.createTempDirectory("mft-seek");
+            StreamPipeline p = pipeline("seeking");
+            p.setWorkspaceRoot(root.toString());
+            // A seekable source and a sink that claims to have written the first 10 bytes.
+            p.addOperator(new SeekableSource("src", data, sourceToldToStartAt), true);
+            p.addOperator(new OffsetReportingSink("sink", 10L, sinkSawUpstreamAt), true);
+            p.validate();
+            p.execute(null, jobWithId("job-seek"));
+
+            assertEquals("the source must be told to start where the sink resumes",
+                    10L, sourceToldToStartAt.get());
+            assertEquals("the sink must read the same number, so its own skip comes out zero",
+                    10L, sinkSawUpstreamAt.get());
+        } finally {
+            JobStores.register(null);
+        }
+    }
+
+    /** A source that records what offset it was asked to begin at. */
+    private static final class SeekableSource implements StreamSource {
+        private final String name;
+        private final byte[] data;
+        private final AtomicLong toldToStartAt;
+
+        SeekableSource(String name, byte[] data, AtomicLong toldToStartAt) {
+            this.name = name;
+            this.data = data;
+            this.toldToStartAt = toldToStartAt;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public boolean materialises() {
+            return true;                      // so the run has durable state and is resumable
+        }
+
+        @Override
+        public boolean seekable() {
+            return true;
+        }
+
+        @Override
+        public SourceIdentity identify(StreamContext ctx) {
+            return new SourceIdentity("file:/in/a.csv", data.length, 1L);
+        }
+
+        @Override
+        public InputStream open(StreamContext ctx) {
+            long at = ctx.upstreamStartsAt();
+            toldToStartAt.set(at);
+            return ctx.resources().register(name,
+                    new ByteArrayInputStream(data, (int) at, data.length - (int) at));
+        }
+    }
+
+    /** A sink that says it already wrote {@code resumeAt} bytes, and records what it was told. */
+    private static final class OffsetReportingSink implements StreamSink {
+        private final String name;
+        private final long resumeAt;
+        private final AtomicLong sawUpstreamAt;
+
+        OffsetReportingSink(String name, long resumeAt, AtomicLong sawUpstreamAt) {
+            this.name = name;
+            this.resumeAt = resumeAt;
+            this.sawUpstreamAt = sawUpstreamAt;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public long durableByteOffset(StreamContext ctx) {
+            return resumeAt;
+        }
+
+        @Override
+        public void consume(InputStream in, StreamContext ctx) throws IOException {
+            sawUpstreamAt.set(ctx.upstreamStartsAt());
+            while (in.read() >= 0) {
+                // drain
+            }
+        }
+    }
+
+    /**
+     * A self-sourcing pipeline must tell its stages how large the source is.
+     *
+     * <p>{@code identify()} is the only thing that knows before a byte moves, and the framework already
+     * calls it for the identity guard. It used to keep the identity and throw the size away:
+     * {@code sourceOpened} was fed from the seed alone, so a pipeline that opened its own source
+     * reported UNKNOWN to everything downstream, always.
+     *
+     * <p>That mattered because an operator cannot ask the source itself. This is a pull pipeline, so
+     * the sink's {@code consume()} — and any {@code expectedSize()} it reads — runs <b>before</b> the
+     * first {@code read()} reaches the source. A size announced by the source on its first read is
+     * always too late for the stage that needed it.
+     */
+    @Test
+    public void aSelfSourcingPipelineReportsTheProbedSizeBeforeAnyStageRuns() throws Exception {
+        byte[] data = "twenty-six bytes of source.".getBytes(StandardCharsets.UTF_8);
+        AtomicReference<Long> seenBySink = new AtomicReference<>();
+
+        JobStores.register(pipelineName -> new JobStore() {
+            @Override
+            public JobRecord start(JobRun run) {
+                return null;
+            }
+        });
+        try {
+            Path root = Files.createTempDirectory("mft-probed-size");
+            StreamPipeline p = pipeline("probed-size");
+            p.setWorkspaceRoot(root.toString());
+            // sourceProvided stays false: the pipeline opens its own source, which is the case that
+            // reported UNKNOWN.
+            p.addOperator(new Mocks.IdentifyingSource("src", data, "file:/in/a.csv"), true);
+            p.addOperator(new StreamSink() {
+                @Override
+                public String name() {
+                    return "sink";
+                }
+
+                @Override
+                public void consume(InputStream in, StreamContext ctx) throws IOException {
+                    // Read at the top of consume, before draining, which is when a real sink sizes
+                    // its work.
+                    seenBySink.set(ctx.job().expectedSize());
+                    while (in.read() >= 0) {
+                        // drain
+                    }
+                }
+            }, true);
+            p.validate();
+
+            // A real job id, so the run id is stable and the run is resumable. That matters: the
+            // framework only probes the source when a resume could happen (identity exists to guard
+            // one), so a scratch run is still told UNKNOWN and still sizes blind. Every queued MFT
+            // transfer is resumable, which is the case this is about.
+            p.execute(null, jobWithId("job-size"));
+
+            assertEquals("the sink must be told the size identify() already reported",
+                    Long.valueOf(data.length), seenBySink.get());
+        } finally {
+            JobStores.register(null);
+        }
     }
 
     /**

@@ -54,6 +54,8 @@ import java.util.List;
  * @param retryable      whether the failure was retryable
  * @param createdAt      when the row was first written
  * @param startedAt      when this attempt began
+ * @param firstStartedAt when the <b>first</b> attempt began
+ * @param workingMillis  milliseconds spent working, summed over the attempts that have ended
  * @param endedAt        when it finished, either way
  * @param updatedAt      when progress was last recorded. <b>Not a liveness signal</b> (ADR-0028)
  */
@@ -62,7 +64,44 @@ public record Run(String runId, String pipelineName, String invokerType, String 
                   String workspacePath, String sourceId, long sourceSize, String currentStage,
                   long bytesDone, long recordsDone, String failedStage, String errorCode,
                   String errorMessage, Boolean retryable, long createdAt, long startedAt,
-                  long endedAt, long updatedAt) {
+                  long firstStartedAt, long workingMillis, long endedAt, long updatedAt) {
+
+    /**
+     * Wall clock for the whole run: first attempt's start to the final end.
+     *
+     * <p>Distinct from {@link #startedAt()}, which is reset every time a transfer is re-claimed and so
+     * marks the <i>last</i> attempt. Both are kept because they answer different questions, and
+     * reporting one under a name that suggests the other is how a resumed transfer comes to look fast:
+     * its last attempt is legitimately shorter than a clean run, having skipped what it already did.
+     *
+     * @param now the current epoch millisecond, used only while the run is unfinished
+     * @return elapsed milliseconds, counting up to {@code now} for a run still in flight
+     */
+    public long elapsedMillis(long now) {
+        if (firstStartedAt <= 0) {
+            return 0L;
+        }
+        return (endedAt > 0 ? endedAt : now) - firstStartedAt;
+    }
+
+    /**
+     * How long the run was actually working, summed across attempts.
+     *
+     * <p>Excludes everything between attempts — the retry back-off, a server that was down, time spent
+     * queued. For a transfer killed once and resumed this is roughly what a clean run would take; for
+     * a clean run it equals {@link #elapsedMillis(long)}. The gap between the two is dead time, and
+     * until these two existed no field answered "how much work did this transfer do".
+     *
+     * <p>{@code workingMillis} is only credited when an attempt <i>ends</i>, so the attempt in flight
+     * is added here rather than read from the column. A caller that reported the column alone would
+     * show a running transfer as doing no work at all until the moment it finished.
+     *
+     * @param now the current epoch millisecond, used only while an attempt is in flight
+     */
+    public long processingMillis(long now) {
+        long inFlight = endedAt <= 0 && startedAt > 0 ? Math.max(0L, now - startedAt) : 0L;
+        return workingMillis + inFlight;
+    }
 
     /**
      * @return the artifacts this run came through, in order; empty when none was identified

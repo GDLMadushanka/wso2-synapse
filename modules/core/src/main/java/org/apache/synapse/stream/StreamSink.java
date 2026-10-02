@@ -60,4 +60,26 @@ public interface StreamSink extends StreamOperator {
      *                         raised it
      */
     void consume(InputStream in, StreamContext ctx) throws StreamException, IOException;
+
+    /**
+     * The byte offset this sink will actually resume from, or {@code -1} when it cannot say.
+     *
+     * <p>Answered <b>before</b> the source is opened, so the framework can tell a seekable source to
+     * start there instead of at zero. Without it a resumed run re-reads everything it already wrote
+     * and throws it away.
+     *
+     * <p>Must be the <b>reconciled</b> position — what this sink will really start writing at, after
+     * whatever check it makes against the destination — not the raw checkpoint. A value larger than
+     * the true resume point leaves a hole in the output; the framework cannot detect that, because
+     * only the sink knows what its destination holds.
+     *
+     * <p>Counted in bytes regardless of the unit the sink checkpoints in. A sink that records blocks
+     * or records converts; one that records bytes returns its position. {@code -1} means "no opinion",
+     * and the source then starts at zero as before, which is always correct and sometimes slow.
+     *
+     * @param ctx this sink's context, from which its checkpoint can be read
+     */
+    default long durableByteOffset(StreamContext ctx) throws IOException {
+        return -1L;
+    }
 }

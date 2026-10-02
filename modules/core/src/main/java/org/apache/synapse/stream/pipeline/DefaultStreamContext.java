@@ -102,6 +102,20 @@ public class DefaultStreamContext implements StreamContext {
                                 String stageName, boolean mayUseWorkspace, boolean mayCheckpoint,
                                 Path workspace, CheckpointStore checkpointStore, int maxReprocessed,
                                 Path scratchTarget) {
+        this(message, job, resources, stageName, mayUseWorkspace, mayCheckpoint, workspace,
+                checkpointStore, maxReprocessed, null, scratchTarget);
+    }
+
+    /**
+     * As above, carrying the deployer's {@code checkpointEvery} for a stage that counts in bytes.
+     * Which of the two cadences applies is decided by the stage's unit, not here — see
+     * {@code DefaultStageArtifact.resolveThreshold}.
+     */
+    public DefaultStreamContext(MessageContext message, JobContext job, ResourceScope resources,
+                                String stageName, boolean mayUseWorkspace, boolean mayCheckpoint,
+                                Path workspace, CheckpointStore checkpointStore, int maxReprocessed,
+                                Long checkpointEvery, Path scratchTarget) {
+        this.checkpointEvery = checkpointEvery;
         this.message = message;
         this.job = job == null ? JobContext.NOOP : job;
         this.resources = resources;
@@ -112,6 +126,16 @@ public class DefaultStreamContext implements StreamContext {
         this.checkpointStore = checkpointStore;
         this.maxReprocessed = Math.max(1, maxReprocessed);
         this.scratchTarget = scratchTarget;
+    }
+
+    @Override
+    public long upstreamStartsAt() {
+        return upstreamStartsAt;
+    }
+
+    /** Pipeline-only. See {@link StreamContext#upstreamStartsAt()} for when this may be non-zero. */
+    void upstreamStartsAt(long offset) {
+        this.upstreamStartsAt = offset;
     }
 
     @Override
@@ -144,6 +168,16 @@ public class DefaultStreamContext implements StreamContext {
 
     /** The deployer's bound on how much work a failure here may cost; never below 1. */
     private final int maxReprocessed;
+
+    /** The deployer's {@code checkpointEvery} in bytes, or {@code null}; consulted only for BYTES. */
+    private final Long checkpointEvery;
+
+    /**
+     * Byte offset at which this stage's upstream begins. Set by the pipeline on a resumed run whose
+     * source could seek; zero otherwise. Mutable because it is decided after the context exists — the
+     * sink has to be asked where it will resume before the source can be told where to start.
+     */
+    private volatile long upstreamStartsAt;
 
     /**
      * Framework-internal. Signalled by {@link DefaultStageArtifact#openComplete()}, never by an
@@ -308,8 +342,9 @@ public class DefaultStreamContext implements StreamContext {
         }
 
         StageArtifact artifact = new DefaultStageArtifact(stageName, workspace, name,
-                unit == null ? null : checkpointStore, unit, formatVersion, maxReprocessed, resources,
-                this::resumedFromArtifact, CANONICAL_ARTIFACT.equals(name));
+                unit == null ? null : checkpointStore, unit, formatVersion, maxReprocessed,
+                checkpointEvery, resources, this::resumedFromArtifact,
+                CANONICAL_ARTIFACT.equals(name));
         artifacts.put(name, new Held(artifact, unit));
         return artifact;
     }
