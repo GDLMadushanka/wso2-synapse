@@ -24,7 +24,7 @@ import java.io.InputStream;
 /**
  * Tail of a byte chain, and the only operator that reads.
  * <p>
- * Exactly one sink per pipeline, and it is last. <b>All execution happens here</b>: the read
+ * Exactly one sink per sequence, and it is last. <b>All execution happens here</b>: the read
  * loop below drives every byte through every upstream decorator to the source. When
  * {@link #consume} returns, the transfer is done.
  *
@@ -45,7 +45,7 @@ public interface StreamSink extends StreamOperator {
      *       commit fails the transfer.</li>
      *   <li><b>Write atomically where you can</b> — temporary name, then rename. Writing
      *       straight to the destination means a failure part-way leaves a truncated artifact,
-     *       and the pipeline cannot prevent that. Atomicity is a sink's responsibility.</li>
+     *       and the sequence cannot prevent that. Atomicity is a sink's responsibility.</li>
      *   <li><b>Poll {@link JobContext#isCancelled()} between reads</b> and throw a retryable
      *       {@link StreamException} when it becomes true. Cancellation is cooperative; a sink
      *       blocked inside a single long {@code read()} cannot be interrupted.</li>

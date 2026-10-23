@@ -18,13 +18,13 @@
 
 package org.apache.synapse.stream;
 
-import org.junit.Test;
-
 import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
-import java.io.InputStream;
-
+import org.apache.synapse.stream.transfer.Transfer;
+import org.apache.synapse.stream.transfer.TransferStatus;
+import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
@@ -59,11 +59,11 @@ public class StreamContractsTest {
 
     @Test
     public void checkpointCarriesPositionOutputLengthUnitAndVersion() {
-        Checkpoint cp = new Checkpoint(50L, 4096L, CheckpointUnit.RECORDS, "v1");
+        Checkpoint cp = new Checkpoint(50L, 4096L, "records", "v1");
 
         assertEquals(50L, cp.position());
         assertEquals(4096L, cp.outputLength());
-        assertEquals(CheckpointUnit.RECORDS, cp.unit());
+        assertEquals("records", cp.unit());
         assertEquals("v1", cp.formatVersion());
     }
 
@@ -74,14 +74,14 @@ public class StreamContractsTest {
 
     @Test
     public void checkpointRejectsAMissingFormatVersion() {
-        assertRejected(() -> new Checkpoint(1L, 0L, CheckpointUnit.BYTES, null), "formatVersion");
-        assertRejected(() -> new Checkpoint(1L, 0L, CheckpointUnit.BYTES, "  "), "formatVersion");
+        assertRejected(() -> new Checkpoint(1L, 0L, "bytes", null), "formatVersion");
+        assertRejected(() -> new Checkpoint(1L, 0L, "bytes", "  "), "formatVersion");
     }
 
     @Test
     public void checkpointRejectsNegativeCounters() {
-        assertRejected(() -> new Checkpoint(-1L, 0L, CheckpointUnit.BYTES, "v1"), "position");
-        assertRejected(() -> new Checkpoint(0L, -1L, CheckpointUnit.BYTES, "v1"), "outputLength");
+        assertRejected(() -> new Checkpoint(-1L, 0L, "bytes", "v1"), "position");
+        assertRejected(() -> new Checkpoint(0L, -1L, "bytes", "v1"), "outputLength");
     }
 
     // ---------- StreamSeed ----------

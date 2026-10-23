@@ -29,7 +29,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Properties;
 
-/** A trivial source, so tests can build a complete source-to-sink pipeline. */
+/** A trivial source, so tests can build a complete source-to-sink sequence. */
 public class ClasspathTestSourceFactory implements StreamOperatorFactory {
 
     static final QName TAG = new QName("http://ws.apache.org/ns/synapse", "test.classpathSource");

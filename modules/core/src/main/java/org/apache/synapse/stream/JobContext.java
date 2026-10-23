@@ -19,7 +19,7 @@
 package org.apache.synapse.stream;
 
 /**
- * The pipeline's channel back to whoever asked for the transfer.
+ * The sequence's channel back to whoever asked for the transfer.
  * <p>
  * Every method has a default, so {@link #NOOP} is a complete implementation and an operator never
  * has to null-check {@code ctx.job()}.
@@ -38,7 +38,7 @@ package org.apache.synapse.stream;
 public interface JobContext {
 
     /**
-     * A complete no-op implementation, used when a pipeline is invoked without a caller that
+     * A complete no-op implementation, used when a sequence is invoked without a caller that
      * wants reporting — a sequence-invoked transfer with no job, for instance.
      */
     JobContext NOOP = new JobContext() {
@@ -47,7 +47,7 @@ public interface JobContext {
     /**
      * The job id {@link #NOOP} reports.
      * <p>
-     * Named so that it can be rejected. Every NOOP run shares it, so a pipeline that keeps durable
+     * Named so that it can be rejected. Every NOOP run shares it, so a sequence that keeps durable
      * state cannot use it to name a workspace — two concurrent runs would collide, and a resume would
      * adopt another run's artifacts. The framework therefore never uses this id to name a
      * workspace unless it is real: it resolves a run id itself, falling back to the seed's identity
@@ -123,7 +123,7 @@ public interface JobContext {
      * <p>
      * Callers must rate-limit; per-byte or per-small-read reporting is not conformant. {@code bytes}
      * counts bytes delivered by the sink rather than read by the source, which differ wherever a
-     * transform changes volume. {@code records} is {@code 0} where the pipeline has no record
+     * transform changes volume. {@code records} is {@code 0} where the sequence has no record
      * semantics — a byte chain does not know what a record is.
      *
      * @param stage   the reporting stage's name
@@ -134,21 +134,44 @@ public interface JobContext {
     }
 
     /**
+     * What a stage is doing right now, for the management API to show.
+     *
+     * <p>Called by the framework, not by operators — an operator uses
+     * {@link StreamContext#status(String)}, which throttles before reaching here. Implementations
+     * should treat this as an upsert keyed by {@code (run, stage)}: the question is what the stage is
+     * doing <b>now</b>, so the previous value is meant to be replaced rather than accumulated. The
+     * ordered history lives in {@code mft-transfer.log} instead (ADR-0069).
+     *
+     * <p>Telemetry on a live transfer, so it must never throw and never block for long.
+     *
+     * <p>Carries the chain index, unlike {@link #stageFinished}, which lets a recorder derive it from
+     * the order stages finish in. Nothing has finished when a stage first reports, so there is no
+     * order to derive from — and without it the management API cannot show the stages in chain order,
+     * which is the whole shape of the display.
+     *
+     * @param stage    the reporting stage's name
+     * @param index    its position in the chain, from zero
+     * @param activity what it is doing, in the operator's own words
+     */
+    default void status(String stage, int index, String activity) {
+    }
+
+    /**
      * How long this stage spent inside <b>deployer-supplied mediation</b>, as opposed to its own work.
      *
      * <p>Only one operator has anything to report here, and that is the point: {@code streaming.forEach}
-     * is the single place the pipeline hands control to a Synapse sequence, so it is the only stage
+     * is the single place the sequence hands control to a Synapse sequence, so it is the only stage
      * whose time is partly someone else's. Everything else is framing, buffering and I/O — its own code
      * — and leaving this unreported is the honest answer for those.
      *
      * <p>Why it is worth separating at all: a stage that takes six seconds tells a deployer nothing
      * actionable. "Six seconds, of which five and a half were your sequence" tells them the framing is
      * not the problem and sends them to the mediators they wrote. Reversed, it sends them to
-     * {@code maxReprocessed} and the record format instead.
+     * {@code checkpointFrequency} and the record format instead.
      *
      * <p><b>Cumulative for the stage, and re-reported after every unit.</b> Not once at the end,
      * because there is no end to report at: a {@code StageStream} is never closed by the framework —
-     * the pipeline releases through its {@link ResourceScope} — so an operator that saved its total
+     * the sequence releases through its {@link ResourceScope} — so an operator that saved its total
      * for a final call reports nothing at all, and the column reads zero. Re-reporting the running
      * total is cheap because it writes to a map, not to the database; the row is written once in the
      * run's {@code finally} block like every other stage figure.
@@ -204,15 +227,6 @@ public interface JobContext {
     }
 
     /**
-     * Whether the caller has asked for this transfer to stop.
-     * <p>
-     * Cooperative only — the pipeline does not interrupt the run thread. Must be cheap, since it
-     * is polled in a read loop: no I/O, no contended lock. Once {@code true}, must stay
-     * {@code true}.
-     *
-     * @return {@code true} if cancellation has been requested
-     */
-    /**
      * Whether the state this run has earned should be <b>thrown away</b> when it stops.
      *
      * <p>Only consulted when {@link #isCancelled()} is true, and it is the whole difference between the
@@ -233,6 +247,15 @@ public interface JobContext {
         return false;
     }
 
+     /**
+     * Whether the caller has asked for this transfer to stop.
+     * <p>
+     * Cooperative only — the sequence does not interrupt the run thread. Must be cheap, since it
+     * is polled in a read loop: no I/O, no contended lock. Once {@code true}, must stay
+     * {@code true}.
+     *
+     * @return {@code true} if cancellation has been requested
+     */
     default boolean isCancelled() {
         return false;
     }

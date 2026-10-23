@@ -365,7 +365,7 @@ public class InvokeMediator extends AbstractMediator implements
 	/**
 	 * Bind this invocation's parameters onto the message, without mediating anything.
 	 *
-	 * <p>Exists for {@code <streamPipeline>}. A pipeline reaches a connector operation the ordinary way
+	 * <p>Exists for {@code <streamSequence>}. A sequence reaches a connector operation the ordinary way
 	 * — this mediator, aimed at the connector's template — but it does not <i>mediate</i> it: it needs
 	 * the operator instance out of the template body and the operation's parameters on the message, then
 	 * it drives the operator itself. That is what lets a connector expose a stream operator with no
@@ -373,7 +373,7 @@ public class InvokeMediator extends AbstractMediator implements
 	 *
 	 * <p>Callers must pair this with {@link TemplateMediator#popFuncContextFrom}, and must treat the
 	 * binding as valid only for the duration of the call they wrap: one template instance is shared by
-	 * every pipeline and every concurrent run that uses the operation.
+	 * every sequence and every concurrent run that uses the operation.
 	 *
 	 * @param synCtx   the message to bind against
 	 * @param template the template this invocation targets
@@ -389,7 +389,7 @@ public class InvokeMediator extends AbstractMediator implements
 	 * template.
 	 *
 	 * <p>Unlike the mediation path this records no continuation state. That bookkeeping exists so a
-	 * suspended flow can resume at a mediator position, and a pipeline operator occupies no position in
+	 * suspended flow can resume at a mediator position, and a sequence operator occupies no position in
 	 * a mediator flow — pushing one would leave a frame nothing ever pops.
 	 *
 	 * @param synCtx the message to run the reference against
@@ -409,7 +409,7 @@ public class InvokeMediator extends AbstractMediator implements
 	 *
 	 * <p>Shared by {@link #mediate} and {@link #bindParameters} so the two paths cannot disagree about
 	 * what a {@code configKey} resolves to. What they do with the result differs — a mediation records
-	 * continuation state around it, a pipeline binding must not — so only the resolution is common.
+	 * continuation state around it, a sequence binding must not — so only the resolution is common.
 	 *
 	 * @param synCtx the message to resolve against
 	 * @return the configuration to mediate, or {@code null} if it could not be found

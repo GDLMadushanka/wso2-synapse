@@ -28,11 +28,85 @@ import org.apache.synapse.message.store.MessageStore;
 import org.apache.synapse.message.store.impl.jms.JmsStore;
 import org.apache.synapse.transport.nhttp.NhttpConstants;
 import org.apache.synapse.util.MessageHelper;
+import org.apache.synapse.SynapseException;
+import org.apache.synapse.mediators.Value;
+import org.apache.synapse.message.store.impl.mft.StreamMessageStore;
+import org.apache.synapse.stream.spi.Invoker;
+import org.apache.synapse.stream.StreamException;
+import org.apache.synapse.stream.transfer.Submission;
+import org.apache.synapse.stream.transfer.TransferStore;
+import org.apache.synapse.stream.transfer.TransferStores;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * <code>MessageStoreMediator</code> will store the incoming Messages in associated MessageStore
+ *
+ * <pre>
+ *   &lt;store messageStore="jms-queue" [sequence="onStore"]/&gt;
+ *
+ *   &lt;store messageStore="bulk-queue" type="MFT" idempotencyKey="{json-eval($.requestId)}"&gt;
+ *       &lt;property name="connection" value="connSmb"/&gt;
+ *       &lt;property name="path" expression="json-eval($.source)"/&gt;
+ *   &lt;/store&gt;
+ * </pre>
+ *
+ * <h2>Two things, told apart by an attribute on the element</h2>
+ * Without {@code type}, or with {@code type="DEFAULT"}, this stores a message: the behaviour it has
+ * always had, reached by code this attribute does not touch. With {@code type="MFT"} it submits a
+ * <b>transfer</b> to an MFT queue and leaves the job id on the message.
+ *
+ * <p>The discriminator is on the element rather than inferred from the store it names, so that
+ * {@code <property/>} children and {@code idempotencyKey} can be refused at <i>parse</i> time instead
+ * of resolving an artifact the parser cannot see. It also means a reader of the sequence can tell
+ * which of the two things this element does without looking the store up.
+ *
+ * <h2>Why submitting is a separate method and not a condition</h2>
+ * A submission must not build the envelope, must not clone the message, must not clear the
+ * continuation stack and must not suppress the response — the caller is about to answer with
+ * {@link #JOB_ID}. Rather than thread five conditions through the storing path, {@link #mediate}
+ * forks once at the top and the two share nothing but the element.
  */
 public class MessageStoreMediator extends AbstractMediator{
+
+    /** {@code type} for an ordinary message store. The default when the attribute is absent. */
+    public static final String DEFAULT_TYPE = "DEFAULT";
+
+    /** {@code type} for an MFT transfer queue. */
+    public static final String MFT_TYPE = "MFT";
+
+    /** Where the answer is left, for the resource that has to respond with it. */
+    public static final String JOB_ID = "mft.jobId";
+
+    /** Whether this call created the transfer, or found one already in flight. */
+    public static final String SUBMITTED = "mft.submitted";
+
+    /**
+     * Why a submission failed, for a resource that answers differently depending.
+     *
+     * <p>{@code CONFLICT} is the caller's to fix — today that means an idempotency key reused for
+     * different values — and maps naturally to {@code 409}. {@code UNAVAILABLE} is ours: the store
+     * could not be reached, and the same request will work once it can.
+     */
+    public static final String ERROR = "mft.submitError";
+
+    public static final String CONFLICT = "CONFLICT";
+    public static final String UNAVAILABLE = "UNAVAILABLE";
+
+    /**
+     * {@link #MFT_TYPE}, or {@code null} for the storing behaviour. Never read on the storing path, so
+     * an existing configuration reaches exactly the code it did before.
+     */
+    private String type;
+
+    /** The caller's assertion of sameness, evaluated per submission. Only set when type is MFT. */
+    private Value idempotencyKey;
+
+    /** The values a submitted transfer carries. Only populated when type is MFT. */
+    private final List<Parameter> parameters = new ArrayList<>();
 
     /**
      * Name of the Mediator
@@ -81,6 +155,9 @@ public class MessageStoreMediator extends AbstractMediator{
         }
 
         if(synCtx != null) {
+            if (MFT_TYPE.equals(type)) {
+                return submitTransfer(synCtx);
+            }
             MessageStore messageStore;
             if (messageStoreExp != null) {
                 messageStore = synCtx.getConfiguration().getMessageStore(messageStoreExp.stringValueOf(synCtx));
@@ -214,5 +291,130 @@ public class MessageStoreMediator extends AbstractMediator{
 
     public SynapsePath getMessageStoreExp() {
         return messageStoreExp;
+    }
+
+    // ------------------------------------------------------------------ MFT submission
+
+    /**
+     * Queues a transfer and leaves its id on the message.
+     *
+     * <p>Nothing here touches the storing path's machinery: no envelope build, no clone, no
+     * continuation-stack clear, and no suppressed response — the caller answers with {@link #JOB_ID}.
+     *
+     * <p>Nothing is validated against the sequence that will run it. The queue does not know which
+     * processor drains it, so it cannot know which parameters a source operator needs; a missing one
+     * fails when the run builds, naming the stage, and is recorded on the transfer.
+     *
+     * @param synCtx the submitting message, whose properties the values are evaluated against
+     * @return always {@code true}; a failure throws rather than returning
+     */
+    private boolean submitTransfer(MessageContext synCtx) {
+
+        String storeName = messageStoreExp != null
+                ? messageStoreExp.stringValueOf(synCtx)
+                : messageStoreName;
+
+        // Resolved before anything is written, because the store's name is what tags the row and a name
+        // nothing drains produces a transfer that waits for ever with no error anywhere. The storing
+        // path gets this for free by dereferencing the store; a submission has to ask.
+        MessageStore store = synCtx.getConfiguration() == null
+                ? null
+                : synCtx.getConfiguration().getMessageStore(storeName);
+        if (store == null) {
+            throw new SynapseException("<store messageStore=\"" + storeName + "\" type=\"" + MFT_TYPE
+                    + "\"/> names a message store that is not deployed, so the transfer would be queued"
+                    + " under a name no message processor drains");
+        }
+        if (!(store instanceof StreamMessageStore)) {
+            throw new SynapseException("<store messageStore=\"" + storeName + "\" type=\"" + MFT_TYPE
+                    + "\"/> names a store that is not an MFT transfer queue. Drop the type attribute to"
+                    + " store a message in it, or name a store declared with "
+                    + StreamMessageStore.class.getName());
+        }
+
+        TransferStore transfers = TransferStores.store();
+        if (transfers == null) {
+            throw new SynapseException("cannot submit a transfer to '" + storeName + "': MFT has no"
+                    + " transfer store. Configure an MFT datasource and deploy the message store");
+        }
+
+        Map<String, String> values = new LinkedHashMap<>();
+        for (Parameter parameter : parameters) {
+            String value = parameter.value().evaluateValue(synCtx);
+            if (value != null) {
+                // A parameter that evaluated to nothing is left out rather than stored empty: the
+                // difference between "not supplied" and "supplied as blank" is one an operator may act
+                // on, and an expression that matched nothing means the former.
+                values.put(parameter.name(), value);
+            }
+        }
+
+        String key = idempotencyKey == null ? null : idempotencyKey.evaluateValue(synCtx);
+
+        // Who is submitting, read off the message the way every other part of Synapse reports the
+        // invoking artifact. Captured here because this is the only moment it exists: the API or proxy
+        // mediating right now will have answered its caller long before a processor claims this row,
+        // and no thread that runs the transfer can see back to it.
+        Invoker submitter = Invoker.of(synCtx);
+
+        Submission submission;
+        try {
+            submission = transfers.submit(storeName, values, key == null || key.isBlank() ? null : key,
+                    submitter == null ? null : submitter.name());
+        } catch (StreamException e) {
+            // Never swallowed. A submission that was not stored must not look accepted: the caller is
+            // about to be handed a job id for a transfer nothing will ever run.
+            //
+            // Retryability is the only thing that separates "you contradicted yourself" from "we could
+            // not reach the database", and it is set by whoever threw: a reused key is not retryable,
+            // an unreachable store is. Left on the message so the fault sequence can answer accordingly
+            // without parsing the text of an error.
+            synCtx.setProperty(ERROR, e.isRetryable() ? UNAVAILABLE : CONFLICT);
+            throw new SynapseException(e.isRetryable()
+                    ? "could not submit a transfer to '" + storeName + "'"
+                    : e.getMessage(), e);
+        }
+
+        synCtx.setProperty(JOB_ID, String.valueOf(submission.jobId()));
+        synCtx.setProperty(SUBMITTED, String.valueOf(submission.created()));
+        if (log.isDebugEnabled()) {
+            log.debug((submission.created() ? "submitted transfer " : "joined transfer ")
+                    + submission.jobId() + " in '" + storeName + "'");
+        }
+        return true;
+    }
+
+    public String getType() {
+        return type;
+    }
+
+    public void setType(String type) {
+        this.type = type;
+    }
+
+    public Value getIdempotencyKey() {
+        return idempotencyKey;
+    }
+
+    public void setIdempotencyKey(Value idempotencyKey) {
+        this.idempotencyKey = idempotencyKey;
+    }
+
+    public List<Parameter> getParameters() {
+        return parameters;
+    }
+
+    public void addParameter(String name, Value value) {
+        parameters.add(new Parameter(name, value));
+    }
+
+    /**
+     * One value a submitted transfer carries.
+     *
+     * @param name  what the operator will read it as, under the {@code mft.} prefix
+     * @param value literal or expression, evaluated once at submission — never at run, when the message
+     *              that carried it is long gone
+     */
+    public record Parameter(String name, Value value) {
     }
 }

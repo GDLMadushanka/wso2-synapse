@@ -171,7 +171,7 @@ public class TemplateMediator extends AbstractListMediator {
      * @param synCtx  Synapse Message context
      */
     /**
-     * Widened from private so a {@code <streamPipeline>} can bind a connector operation's parameters
+     * Widened from private so a {@code <streamSequence>} can bind a connector operation's parameters
      * without mediating the template — see {@code InvokeMediator.bindParameters}. Its counterpart
      * {@link #popFuncContextFrom} was already public, so the pair is now symmetric.
      */

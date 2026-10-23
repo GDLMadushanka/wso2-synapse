@@ -26,7 +26,7 @@ import javax.xml.namespace.QName;
 import java.util.Properties;
 
 /**
- * Builds one {@link StreamOperator} from one XML element inside a {@code <streamPipeline>}.
+ * Builds one {@link StreamOperator} from one XML element inside a {@code <streamSequence>}.
  * <p>
  * This exists because Synapse has no finder for the children of a non-mediator artifact.
  * {@code MediatorFactoryFinder} returns a {@code Mediator}, so reusing it would force every operator
@@ -43,15 +43,15 @@ import java.util.Properties;
  *
  * <h2>Two things implementations must get right</h2>
  * <b>Parse configuration into the operator, not out of the message.</b> A factory produces one
- * operator instance per pipeline element, so configuration read here becomes immutable per-instance
+ * operator instance per sequence element, so configuration read here becomes immutable per-instance
  * state. Reading it from the message at run time instead would be both slower and, for an operator
- * shared between pipelines, wrong.
+ * shared between sequences, wrong.
  * <p>
  * <b>Reject unknown attributes rather than ignoring them.</b> A typo that deploys as a default is a
  * transfer that silently does the wrong thing.
  * <p>
  * Also: an operator jar must depend on {@code synapse-core} at {@code provided} scope. A bundled copy
- * gives the operator a different {@code StreamOperator} class than the pipeline loads, and every
+ * gives the operator a different {@code StreamOperator} class than the sequence loads, and every
  * {@code instanceof} check then fails with a message that points nowhere near the cause.
  */
 public interface StreamOperatorFactory {
@@ -67,7 +67,7 @@ public interface StreamOperatorFactory {
     /**
      * Builds an operator from its configuration element.
      *
-     * @param elem       the element, as written in the pipeline
+     * @param elem       the element, as written in the sequence
      * @param properties deployment properties, as passed to other Synapse factories
      * @return the operator; never {@code null}
      * @throws StreamException if the configuration is unusable, so that deployment fails rather than

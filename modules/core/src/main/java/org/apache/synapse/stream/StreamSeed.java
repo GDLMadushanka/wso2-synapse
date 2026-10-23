@@ -23,12 +23,12 @@ import java.io.InputStream;
 /**
  * A stream supplied by the caller, together with the identity of what it came from.
  * <p>
- * Passed to a pipeline declaring {@code sourceProvided="true"}, whose first operator is a
+ * Passed to a sequence declaring {@code sourceProvided="true"}, whose first operator is a
  * transform rather than a source. The motivating case is a file inbound endpoint, which has
  * already opened the file — it holds the connection, the lock, the size and the modification
- * time, because it needed all of them to filter and lock the file. Making the pipeline re-open by
+ * time, because it needed all of them to filter and lock the file. Making the sequence re-open by
  * path would be wasteful, and racy: the file can change between the endpoint's stat and the
- * pipeline's open.
+ * sequence's open.
  *
  * <h2>The identity is the provider's, and the framework never looks inside it</h2>
  * The framework does exactly two things with {@link #identity()}: it hashes it to name the run, and it
@@ -58,8 +58,8 @@ import java.io.InputStream;
  * costs correctness. When in doubt, include more.
  *
  * <h2>Ownership of the stream stays with the provider</h2>
- * The pipeline does not close it. A transform's {@code FilterInputStream.close()} cascades
- * downward and a resource scope closes what it registers, so the pipeline shields the stream
+ * The sequence does not close it. A transform's {@code FilterInputStream.close()} cascades
+ * downward and a resource scope closes what it registers, so the sequence shields the stream
  * before building the chain to avoid closing it twice.
  *
  * <h2>The origin is required, and deliberately has no default</h2>
@@ -133,7 +133,6 @@ public record StreamSeed(InputStream stream, String identity, long size, long la
         }
     }
 
-    /** @return {@code true} if a later attempt could obtain these bytes again */
     /**
      * Whether this seed can name a run, and therefore whether anything could resume it.
      *
@@ -145,6 +144,7 @@ public record StreamSeed(InputStream stream, String identity, long size, long la
         return identity != null;
     }
 
+    /** @return {@code true} if a later attempt could obtain these bytes again */
     public boolean isReopenable() {
         return origin == StreamOrigin.REOPENABLE;
     }

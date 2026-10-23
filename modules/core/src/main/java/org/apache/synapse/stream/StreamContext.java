@@ -20,7 +20,9 @@ package org.apache.synapse.stream;
 
 import org.apache.synapse.MessageContext;
 
+import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 
 /**
  * Everything one operator gets, for one invocation.
@@ -29,11 +31,11 @@ import java.nio.file.Path;
  * the same run do not see the same value.
  *
  * <h2>Capability gating</h2>
- * {@link #workspace()} and the {@code artifact(...)} accessors are legal only for an operator that
+ * The {@code artifact(...)} accessors are legal only for an operator that
  * declared the matching flag on {@link StreamOperator}. Calling one without the declaration is a
  * programming error and throws.
  * <p>
- * Note there is no accessor for the raw {@link CheckpointStore}. Durable state reaches an operator
+ * Note there is no accessor for the raw {@link org.apache.synapse.stream.spi.CheckpointStore CheckpointStore}. Durable state reaches an operator
  * only through {@link StageArtifact}, which fuses the write, the {@code fsync} and the position
  * advance into one call so they cannot be reordered — the coupling that both comparable frameworks
  * had to rewrite. Handing out the store separately would put that ordering back in an author's hands
@@ -52,7 +54,7 @@ public interface StreamContext {
      * <p>
      * Present so an operator can read configuration a caller left on the message and so a
      * connector operation can resolve a tenant-qualified connection. It is <b>not</b> where the
-     * bytes are: the payload is not built, and a pipeline exists precisely to avoid building it.
+     * bytes are: the payload is not built, and a sequence exists precisely to avoid building it.
      *
      * @return the invoking message context; never {@code null}
      */
@@ -83,26 +85,27 @@ public interface StreamContext {
     String stageName();
 
     /**
-     * This operator's private directory inside the run's workspace.
-     * <p>
-     * A stage owns a <b>directory</b>, not a file, so an operator producing several artifacts —
-     * a routing sink writing per-destination outputs, say — needs no change to the layout.
-     * <p>
-     * Write only here. Writing to a configured or hardcoded absolute path instead bypasses the
-     * deployment-time workspace check, breaks isolation between runs, and makes retention
-     * unmanageable.
-     * <p>
-     * <b>Prefer {@link #artifact()}.</b> Anything written through this path directly is outside the
-     * run's commit and abort handling, so it is neither published on success nor discarded on
-     * failure — which is the defect invariant 5 exists to prevent. Use it for genuinely auxiliary
-     * files, and the artifact accessors for anything a later attempt might read.
+     * This stage's named working files matching {@code glob}, in no particular order.
      *
-     * @return this stage's workspace directory; never {@code null}
-     * @throws IllegalStateException if this operator declared neither
-     *                               {@link StreamOperator#materialises()} nor
-     *                               {@link StreamOperator#checkpointed()}
+     * <p>The way a stage finds what a previous attempt left behind. A merge sort lists its {@code run-*}
+     * files to decide whether to resume the merge or start a fresh split, and {@link StageArtifact#discard()}
+     * is how it clears them.
+     *
+     * <p><b>The canonical artifact is never returned</b>, whatever the glob says, and neither are the
+     * {@code .part} files behind any artifact. Both belong to the framework: one is the stage's output and
+     * the run decides whether it is published, the other is a write in progress.
+     *
+     * <p>{@code glob} is a file-name pattern within this stage's directory and nothing more — a separator,
+     * a {@code ..} or a null byte is refused rather than resolved. There is deliberately no way to name a
+     * directory, this one included: a stage can reach its own working files and nothing else.
+     *
+     * @param glob a file-name pattern such as {@code "run-*"}
+     * @return the matching named artifacts; empty when none match or the stage has no workspace
+     * @throws IllegalStateException if the operator declared neither {@code materialises()} nor
+     *                               {@code checkpointed()}
+     * @throws IOException           if the stage's directory could not be read
      */
-    Path workspace();
+    List<StageArtifact> artifacts(String glob) throws IOException;
 
     /**
      * A private directory for this stage's working files, <b>removed when the run ends</b>.
@@ -134,6 +137,46 @@ public interface StreamContext {
     Path scratch();
 
     /**
+     * Says what this stage is doing, for a human watching a transfer.
+     *
+     * <pre>
+     *   ctx.status("splitting: sealed run 47, 3.2 GB read");
+     * </pre>
+     *
+     * <h2>This is not a checkpoint. Nothing resumes from it.</h2>
+     * The distinction matters more than anything else on this method, because the two read alike.
+     * {@link StageArtifact#unitDone} is a <b>durability contract</b> — do the work, confirm it
+     * landed, then advance — and a call made at the wrong moment is silent data loss.
+     * {@code status} is telemetry: not durable, never read back, and discarding every call would
+     * cost nothing but a blank console. If you are about to call this to record how far you got,
+     * you wanted {@code unitDone}.
+     *
+     * <h2>Call it whenever you have something new to say</h2>
+     * There is no cadence to respect and no rate limit to honour. A call sets a field and writes one
+     * line; the database write behind it is throttled by the framework, so how often you call and how
+     * much the deployment pays are independent. That is the whole point — an operator should never
+     * have to choose between being informative and being fast.
+     *
+     * <p>What it should <i>not</i> be is a running commentary on work that is already visible. Bytes
+     * flowing through a streaming stage are measured for you. This is for what the framework cannot
+     * see: a stage that is busy without emitting anything. {@code streaming.sort} is the case it
+     * exists for — its split phase reads an entire file before producing a byte, and without this
+     * there is nothing to distinguish it from a hang.
+     *
+     * <h2>Where it goes</h2>
+     * To {@code mft-transfer.log} on every call, prefixed with the run id and this stage; and to
+     * {@code MFT_JOB_STAGE.ACTIVITY}, where the management API reads it. The log is the history, the
+     * column is the current value, and there is no third store (ADR-0069).
+     *
+     * <p>Never throws, whatever happens underneath. A transfer must not fail because telemetry did.
+     *
+     * @param activity what this stage is doing, in the operator's own words; {@code null} or blank
+     *                 is ignored
+     */
+    default void status(String activity) {
+    }
+
+    /**
      * This stage's artifact, for an operator that only {@code materialises()}.
      *
      * <p>Obtaining it performs no I/O, so this is safe to call from {@code open()} or {@code wrap()}.
@@ -142,7 +185,7 @@ public interface StreamContext {
      *
      * <p>The name is framework-defined, {@code <workspace>/artifact.out}, and deliberately not the
      * operator's to choose: restart decides what is already done by looking for that file, so a
-     * name picked by the operator would leave the pipeline guessing.
+     * name picked by the operator would leave the sequence guessing.
      *
      * @return this stage's artifact; never {@code null}
      * @throws IllegalStateException if this operator declared neither {@code materialises()} nor
@@ -155,22 +198,37 @@ public interface StreamContext {
      * This stage's artifact, for an operator that {@code checkpointed()}s — with or without an
      * artifact of its own.
      *
-     * <p>Both arguments exist because a bare number is not a checkpoint. The {@code unit} says what
-     * the position counts, which is not optional: {@code Reader.skip()} skips characters while
+     * <p>All three arguments exist because a bare number is not a checkpoint. The {@code unit} says
+     * what the position counts, which is not optional: {@code Reader.skip()} skips characters while
      * {@code InputStream.skip()} skips bytes, so the same stored number resumes to a different place
      * depending on how the input was read. The {@code formatVersion} is the operator's own tag, so a
      * later version of it can refuse a checkpoint it cannot interpret rather than misreading one.
+     * The {@code checkpointFrequency} is the deployer's cadence, in that same unit.
+     *
+     * <h2>Why the operator passes the cadence in</h2>
+     * It used to be a framework-reserved stage attribute the framework read for itself, which meant
+     * it could not appear in a connector's parameter form — the tooling builds that form from the
+     * template's parameters, and an attribute is invisible to it (ADR-0067). It is now an ordinary
+     * parameter of the operator that counts the units, read and passed in here.
+     *
+     * <p>It is a required argument rather than an overload precisely so an operator cannot forget
+     * it: a checkpointed stage with no cadence silently gets one checkpoint per unit, which is
+     * correct and slow, and nobody would notice until a throughput complaint. The operator supplies
+     * its own default when the deployer left the parameter out — conventionally 1, the cautious
+     * value (ADR-0025).
      *
      * <p>An operator that keeps a position but writes no bytes uses this and never calls
      * {@code append} — no file is created, and its checkpoint records an artifact length of zero.
      *
-     * @param unit          what the positions passed to {@link StageArtifact#unitDone} count
-     * @param formatVersion the operator's own format tag; never {@code null} or blank
+     * @param unit                what the positions passed to {@link StageArtifact#unitDone} count
+     * @param formatVersion       the operator's own format tag; never {@code null} or blank
+     * @param checkpointFrequency how many of this stage's units may pass between checkpoints, and so
+     *                            how many a failure may reprocess; values below 1 are read as 1
      * @return this stage's artifact; never {@code null}
      * @throws IllegalStateException if this operator did not declare
      *                               {@link StreamOperator#checkpointed()}
      */
-    StageArtifact artifact(CheckpointUnit unit, String formatVersion);
+    StageArtifact artifact(String unit, String formatVersion, int checkpointFrequency);
 
     /**
      * An additional artifact for this stage, named.
@@ -203,20 +261,6 @@ public interface StreamContext {
     StageArtifact artifact(String name);
 
     /**
-     * How many checkpoint units a failure at this stage may cost — the deployer's {@code maxReprocessed},
-     * or 1 when they set none.
-     *
-     * <p>A checkpointed operator must honour this: record a checkpoint at least every N units. It is the
-     * width of the duplicate window and the only lever on per-unit durability cost, and it belongs to the
-     * deployer alone — no operator declares anything about it.
-     *
-     * <p>Higher is not free in the other direction either. Between checkpoints the artifact needs no
-     * durable flush, because resume truncates back to the last recorded length, so a wider bound removes
-     * most of the {@code fsync} traffic on a shared mount.
-     *
-     * @return at least 1
-     */
-    /**
      * The byte offset at which this stage's upstream stream begins. Zero unless a resume moved it.
      *
      * <p><b>One number, read by both ends</b>, which is what keeps them from disagreeing. A seekable
@@ -232,8 +276,5 @@ public interface StreamContext {
         return 0L;
     }
 
-    default int maxReprocessed() {
-        return 1;
-    }
 
 }

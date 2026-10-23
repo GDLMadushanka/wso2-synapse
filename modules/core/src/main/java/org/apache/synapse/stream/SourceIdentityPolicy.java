@@ -47,7 +47,7 @@ public enum SourceIdentityPolicy {
     /**
      * Refuse the run. The transfer fails with an error naming both identities.
      *
-     * <p>For a pipeline where a mid-flight source change means something has gone wrong upstream and
+     * <p>For a sequence where a mid-flight source change means something has gone wrong upstream and
      * continuing is worse than stopping.
      */
     STRICT,

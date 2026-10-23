@@ -229,7 +229,7 @@ public class ResourceScopeTest {
 
     /**
      * The defect this split exists for: a failed run must not publish its partial artifact. Before
-     * abort() existed, the pipeline's finally block closed committing resources on every path, so a
+     * abort() existed, the sequence's finally block closed committing resources on every path, so a
      * transfer that died at 60% renamed its truncated output into place and the next attempt read
      * that as a completed segment.
      */

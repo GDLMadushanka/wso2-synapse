@@ -44,9 +44,9 @@ import org.apache.synapse.task.Task;
  * operator configures, pauses and resumes an MFT processor exactly as they already do a forwarding one.
  *
  * <h2>What it does differently</h2>
- * It claims <b>descriptors</b>, not messages, and runs the pipeline each one names (ADR-0041). Nothing is
+ * It claims <b>descriptors</b>, not messages, and runs the sequence each one names (ADR-0041). Nothing is
  * dispatched into a sequence: the descriptor is the unit of work, and putting a sequence in between would
- * make the pipeline it names decorative.
+ * make the sequence it names decorative.
  *
  * <h2>The parameters, and what they cost to get wrong</h2>
  * <ul>
@@ -71,7 +71,7 @@ import org.apache.synapse.task.Task;
  * <h2>Three hooks, all optional</h2>
  * {@code sequence} runs after a transfer completes, {@code fault.sequence} when one is given up, and
  * {@code message.processor.deactivate.sequence} when this processor stops itself. They are where a
- * confirmation email, a ledger row or an alert belongs — none of it is expressible in a pipeline, which
+ * confirmation email, a ledger row or an alert belongs — none of it is expressible in a sequence, which
  * moves bytes and knows nothing about what the transfer meant. A hook never changes a transfer's
  * outcome. ADR-0042.
  */

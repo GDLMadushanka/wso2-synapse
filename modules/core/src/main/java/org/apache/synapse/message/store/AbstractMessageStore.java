@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-public abstract class AbstractMessageStore implements MessageStore {
+public abstract class  AbstractMessageStore implements MessageStore {
     private static final Log logger = LogFactory.getLog(AbstractMessageStore.class.getName());
 
     /**

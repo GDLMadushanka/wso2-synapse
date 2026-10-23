@@ -25,13 +25,13 @@ import org.apache.synapse.MessageContext;
 import org.apache.synapse.core.SynapseEnvironment;
 import org.apache.synapse.message.processor.MessageProcessor;
 import org.apache.synapse.stream.JobContext;
-import org.apache.synapse.stream.Invoker;
+import org.apache.synapse.stream.spi.Invoker;
 import org.apache.synapse.stream.StreamException;
-import org.apache.synapse.stream.Transfer;
-import org.apache.synapse.stream.TransferStatus;
-import org.apache.synapse.stream.TransferStore;
-import org.apache.synapse.stream.TransferStores;
-import org.apache.synapse.stream.pipeline.StreamPipeline;
+import org.apache.synapse.stream.transfer.Transfer;
+import org.apache.synapse.stream.transfer.TransferStatus;
+import org.apache.synapse.stream.transfer.TransferStore;
+import org.apache.synapse.stream.transfer.TransferStores;
+import org.apache.synapse.stream.sequence.StreamSequence;
 import org.apache.synapse.task.Task;
 
 import java.util.Map;
@@ -52,14 +52,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <h2>What it does with a claimed transfer</h2>
  * Builds a message, sets the descriptor's parameters on it as {@code mft.}-prefixed properties, and
- * executes the pipeline the descriptor names (ADR-0041). The message carries no payload and is not
+ * executes the sequence the descriptor names (ADR-0041). The message carries no payload and is not
  * mediated — it exists because a connector operation reads its configuration from the message it is bound
  * against (ADR-0026), so {@code file.streamRead} has nowhere to read {@code path} from without one.
  *
  * <h2>Outcomes</h2>
  * <ul>
- *   <li><b>Success</b> — nothing to do. The run already moved its own job row to {@code DONE}; the row
- *       leaving {@code QUEUED} <i>is</i> the acknowledgement (ADR-0040).</li>
+ *   <li><b>Success</b> — the transfer row is moved to {@code DONE} here. It is a separate row from
+ *       the run's own job record (ADR-0044), so finishing the run does not finish the submission;
+ *       this is the acknowledgement, and failing to write it leaves the transfer looking claimed
+ *       until this node's next startup sweep.</li>
  *   <li><b>Retryable failure</b> — requeued with the same job id, so the next attempt resumes from the
  *       checkpoint the last one left, and not claimable again until {@code retry.interval} has passed.</li>
  *   <li><b>Non-retryable failure</b> — left {@code FAILED}. An unparseable file or a rejected
@@ -70,7 +72,7 @@ public class MFTTransferService implements Task, ManagedLifecycle {
 
     private static final Log log = LogFactory.getLog(MFTTransferService.class);
 
-    /** Every descriptor parameter reaches the pipeline under this prefix. */
+    /** Every descriptor parameter reaches the sequence under this prefix. */
     static final String PARAMETER_PREFIX = "mft.";
 
     // The hook parameters. The deactivate one keeps the name ForwardingService already uses, because an
@@ -83,16 +85,16 @@ public class MFTTransferService implements Task, ManagedLifecycle {
     static final String MEMBER_COUNT = "member.count";
 
     /**
-     * The pipeline this processor invokes. Required, and deliberately here rather than in a queue row:
+     * The sequence this processor invokes. Required, and deliberately here rather than in a queue row:
      * the processor is what runs a transfer, exactly as a forwarding processor owns its endpoint. Two
      * processors on one store that disagreed about it would be draining the same queue into different
      * work (ADR-0043).
      */
-    static final String PIPELINE_PARAMETER = "pipeline";
+    static final String SEQUENCE_PARAMETER = "streamSequence";
 
     // What a hook is told about the transfer it is reacting to.
     private static final String JOB_ID = PARAMETER_PREFIX + "jobId";
-    private static final String PIPELINE = PARAMETER_PREFIX + "pipeline";
+    private static final String SEQUENCE_PROPERTY = PARAMETER_PREFIX + "sequence";
     private static final String RUN_ID = PARAMETER_PREFIX + "runId";
     private static final String STATUS = PARAMETER_PREFIX + "status";
     private static final String ATTEMPT = PARAMETER_PREFIX + "attempt";
@@ -119,7 +121,7 @@ public class MFTTransferService implements Task, ManagedLifecycle {
     /** Consecutive give-ups that stop the processor. Zero means never. */
     private int deactivateAfter = 10;
 
-    private String pipelineName;
+    private String sequenceName;
     private String successSequence;
     private String faultSequence;
     private String deactivateSequence;
@@ -156,12 +158,12 @@ public class MFTTransferService implements Task, ManagedLifecycle {
         retryInterval = readPositiveInt(parameters, retryIntervalPropName, (int) retryInterval);
         deactivateAfter = readCount(parameters, DEACTIVATE_AFTER, deactivateAfter);
         dropOnExhaustion = !"Disabled".equalsIgnoreCase(text(parameters, MAX_DELIVERY_DROP, "Enabled"));
-        pipelineName = text(parameters, PIPELINE_PARAMETER, null);
-        if (pipelineName == null) {
+        sequenceName = text(parameters, SEQUENCE_PARAMETER, null);
+        if (sequenceName == null) {
             // Not fatal at init -- the processor is already deployed and a throw here would leave it
             // half-started -- but nothing can run, so this must be impossible to miss in a log.
             log.error("MFT message processor '" + messageProcessor.getName() + "' has no '"
-                    + PIPELINE_PARAMETER + "' parameter, so it does not know what to run. No transfer"
+                    + SEQUENCE_PARAMETER + "' parameter, so it does not know what to run. No transfer"
                     + " will be claimed from message store '" + messageProcessor.getMessageStoreName()
                     + "' until one is configured");
         }
@@ -204,7 +206,7 @@ public class MFTTransferService implements Task, ManagedLifecycle {
             init(synapseEnvironment);
         }
 
-        if (pipelineName == null) {
+        if (sequenceName == null) {
             return;         // already reported at init; claiming would strand transfers as CLAIMED
         }
         TransferStore store = TransferStores.store();
@@ -260,13 +262,13 @@ public class MFTTransferService implements Task, ManagedLifecycle {
      * leave the row {@code CLAIMED} with nothing running it.
      */
     private void run(TransferStore store, Transfer transfer) {
-        StreamPipeline pipeline = synapseEnvironment.getSynapseConfiguration()
-                .getStreamPipeline(pipelineName);
-        if (pipeline == null) {
-            // Recoverable rather than corrupt: deploy the pipeline and the retry runs. Failing the
+        StreamSequence sequence = synapseEnvironment.getSynapseConfiguration()
+                .getStreamSequence(sequenceName);
+        if (sequence == null) {
+            // Recoverable rather than corrupt: deploy the sequence and the retry runs. Failing the
             // transfer would make a deployment-ordering mistake permanent.
             log.error("MFT message processor '" + messageProcessor.getName() + "' is configured to run"
-                    + " stream pipeline '" + pipelineName + "', which is not deployed. Transfer '"
+                    + " stream sequence '" + sequenceName + "', which is not deployed. Transfer '"
                     + transfer.jobId() + "' goes back to the queue");
             requeue(store, transfer, System.currentTimeMillis() + retryInterval);
             return;
@@ -283,13 +285,13 @@ public class MFTTransferService implements Task, ManagedLifecycle {
         linkRun(store, transfer);
 
         try {
-            // No seed: a queued flow cannot carry one, which is why its pipeline opens its own source.
+            // No seed: a queued flow cannot carry one, which is why its sequence opens its own source.
             // The job id names the run, so an attempt lands in the workspace the last one left.
             TransferJobContext jobCtx = new TransferJobContext(transfer.runName(),
                     invocationPath(transfer), store, transfer.jobId());
-            pipeline.execute(msg, jobCtx, null);
-            log.info("transfer " + transfer.jobId() + " completed through stream pipeline '"
-                    + pipelineName + "'");
+            sequence.execute(msg, jobCtx, null);
+            log.info("transfer " + transfer.jobId() + " completed through stream sequence '"
+                    + sequenceName + "'");
             consecutiveGiveUps.set(0);
             finish(store, transfer, TransferStatus.DONE, null, null);
             describe(msg, transfer, TransferStatus.DONE.name());
@@ -304,10 +306,10 @@ public class MFTTransferService implements Task, ManagedLifecycle {
             }
             afterFailure(store, transfer, msg, e);
         } catch (RuntimeException | Error e) {
-            // Including Error: the pipeline rethrows those unwrapped, and a worker thread that dies
+            // Including Error: the sequence rethrows those unwrapped, and a worker thread that dies
             // silently leaves a CLAIMED row nothing will ever pick up.
-            log.error("transfer " + transfer.jobId() + " failed unexpectedly through stream pipeline '"
-                    + pipelineName + "'", e);
+            log.error("transfer " + transfer.jobId() + " failed unexpectedly through stream sequence '"
+                    + sequenceName + "'", e);
             requeue(store, transfer, System.currentTimeMillis() + retryInterval);
         }
     }
@@ -378,7 +380,7 @@ public class MFTTransferService implements Task, ManagedLifecycle {
      */
     private void giveUp(TransferStore store, Transfer transfer, MessageContext msg,
                         StreamException failure) {
-        String code = failure.isRetryable() ? "STREAM_PIPELINE_EXHAUSTED" : "STREAM_PIPELINE_FAILED";
+        String code = failure.isRetryable() ? "STREAM_SEQUENCE_EXHAUSTED" : "STREAM_SEQUENCE_FAILED";
         finish(store, transfer, TransferStatus.FAILED, code, withRootCause(failure));
         describe(msg, transfer, TransferStatus.FAILED.name());
         msg.setProperty(ERROR_CODE, code);
@@ -423,7 +425,7 @@ public class MFTTransferService implements Task, ManagedLifecycle {
     /**
      * The failure, with the reason underneath it.
      *
-     * <p>A pipeline's own message names the pipeline and nothing else -- "stream pipeline 'x' failed" --
+     * <p>A sequence's own message names the sequence and nothing else -- "stream sequence 'x' failed" --
      * because the stage that failed is attributed separately. That is fine in a log, where the stack
      * trace follows, and useless on a job record read over HTTP by someone who cannot see the log. So
      * the root cause is appended, which is where "file not found on connection 'conn1'" lives.
@@ -444,7 +446,7 @@ public class MFTTransferService implements Task, ManagedLifecycle {
     /** What every hook is told about the transfer it is reacting to. */
     private void describe(MessageContext msg, Transfer transfer, String status) {
         msg.setProperty(JOB_ID, String.valueOf(transfer.jobId()));
-        msg.setProperty(PIPELINE, pipelineName);
+        msg.setProperty(SEQUENCE_PROPERTY, sequenceName);
         msg.setProperty(RUN_ID, transfer.runName());
         msg.setProperty(STATUS, status);
         // Not +1: the claim already counted this attempt, and the store hands back the incremented
@@ -617,11 +619,11 @@ public class MFTTransferService implements Task, ManagedLifecycle {
     }
 
     /**
-     * What the pipeline is told about the transfer it is running.
+     * What the sequence is told about the transfer it is running.
      *
      * <p>The job id, which names the run -- naming it the same way on every attempt is what lets the
      * second attempt resume into the first one's workspace (ADR-0020) -- and the invocation path, which
-     * the pipeline cannot work out for itself because none of the artifacts in it are on this thread.
+     * the sequence cannot work out for itself because none of the artifacts in it are on this thread.
      */
     private static final class TransferJobContext implements JobContext {
 

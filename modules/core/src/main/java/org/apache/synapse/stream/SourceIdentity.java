@@ -21,7 +21,7 @@ package org.apache.synapse.stream;
 /**
  * What a source says it is about to read, obtained without reading it.
  *
- * <p>The same three values a {@link StreamSeed} carries, for the case where nobody handed the pipeline
+ * <p>The same three values a {@link StreamSeed} carries, for the case where nobody handed the sequence
  * a stream: a queued transfer names a resource, and only the source operator knows how to look at it.
  *
  * <h2>The identity is opaque</h2>

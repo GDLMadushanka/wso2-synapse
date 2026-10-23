@@ -45,7 +45,7 @@ package org.apache.synapse.stream;
  * paged for a hang. The reverse merely turns a transient blip into a transfer someone restarts by
  * hand.
  * <p>
- * This class only reports a verdict. The pipeline never retries internally — retry count, backoff
+ * This class only reports a verdict. The sequence never retries internally — retry count, backoff
  * and whether the transfer can be re-attempted at all belong to the caller.
  */
 public class StreamException extends Exception {

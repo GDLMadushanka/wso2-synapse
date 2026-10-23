@@ -21,22 +21,22 @@ package org.apache.synapse.stream;
 /**
  * Whether the bytes a run reads can be obtained again by a later attempt.
  *
- * <h2>Why this is not a property of the pipeline</h2>
- * It is tempting to treat "resumable" as something a pipeline declares, but the same pipeline —
+ * <h2>Why this is not a property of the sequence</h2>
+ * It is tempting to treat "resumable" as something a sequence declares, but the same sequence —
  * the same operators, the same configuration — is resumable when fed a file and not resumable when
  * fed the body of an HTTP request. Nothing about the operators changed; the origin did. So this is
  * the axis on which a run is durable or ephemeral, and it belongs to the source, never to the
  * artifact.
  *
- * <p>The consequence is deliberate: one pipeline artifact can be referenced from a file inbound
+ * <p>The consequence is deliberate: one sequence artifact can be referenced from a file inbound
  * endpoint <i>and</i> from an API resource handling a multipart body, and each invocation gets the
- * behaviour that is correct for it. A pipeline-level mode attribute would force the author to pick
- * one and copy the pipeline to get the other.
+ * behaviour that is correct for it. A sequence-level mode attribute would force the author to pick
+ * one and copy the sequence to get the other.
  *
  * <h2>This is not about side effects</h2>
  * A one-shot origin can still feed an operator whose effects would be harmful to repeat — there is
  * simply never a second attempt in which to repeat them. How much work a failure may cost is a separate
- * question, answered per stage by {@code maxReprocessed} and by nothing an operator declares.
+ * question, answered per stage by {@code checkpointFrequency} and by nothing an operator declares.
  *
  * @see StreamSource#origin()
  * @see StreamSeed

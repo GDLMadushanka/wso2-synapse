@@ -22,6 +22,7 @@ package org.apache.synapse.config.xml;
 import org.apache.axiom.om.OMAttribute;
 import org.apache.axiom.om.OMElement;
 import org.apache.synapse.Mediator;
+import org.apache.synapse.mediators.Value;
 import org.apache.synapse.mediators.store.MessageStoreMediator;
 
 import javax.xml.namespace.QName;
@@ -38,6 +39,8 @@ public class MessageStoreMediatorSerializer extends AbstractMediatorSerializer {
     private static final QName STORE_Q    = new QName(XMLConfigConstants.SYNAPSE_NAMESPACE, "store");
     private static final String  ATT_MESSAGE_STORE   = "messageStore";
     private static final String  ATT_SEQUENCE   = "sequence";
+    private static final String  ATT_TYPE = "type";
+    private static final String  ATT_IDEMPOTENCY_KEY = "idempotencyKey";
 
     @Override
     protected OMElement serializeSpecificMediator(Mediator m) {
@@ -81,10 +84,43 @@ public class MessageStoreMediatorSerializer extends AbstractMediatorSerializer {
             storeElem.addAttribute(sequenceAtt);
         }
 
+        String type = messageStoreMediator.getType();
+        // Written only when it is MFT: DEFAULT is parsed back to null, so writing it would turn an
+        // element that round-tripped as it was written into one that gained an attribute.
+        if (type != null) {
+            storeElem.addAttribute(fac.createOMAttribute(ATT_TYPE, nullNS, type));
+        }
+
+        Value idempotencyKey = messageStoreMediator.getIdempotencyKey();
+        if (idempotencyKey != null) {
+            storeElem.addAttribute(fac.createOMAttribute(ATT_IDEMPOTENCY_KEY, nullNS,
+                    text(idempotencyKey)));
+        }
+
+        for (MessageStoreMediator.Parameter parameter : messageStoreMediator.getParameters()) {
+            OMElement property = fac.createOMElement("property", synNS);
+            property.addAttribute(fac.createOMAttribute("name", nullNS, parameter.name()));
+            Value value = parameter.value();
+            if (value.getExpression() != null) {
+                property.addAttribute(fac.createOMAttribute("expression", nullNS,
+                        value.getExpression().toString()));
+            } else {
+                property.addAttribute(fac.createOMAttribute("value", nullNS, value.getKeyValue()));
+            }
+            storeElem.addChild(property);
+        }
+
         serializeComments(storeElem, messageStoreMediator.getCommentsList());
 
         return storeElem;
 
+    }
+
+    /** An expression round-trips as {@code {…}}, which is how the factory recognises one. */
+    private static String text(Value value) {
+        return value.getExpression() == null
+                ? value.getKeyValue()
+                : "{" + value.getExpression().toString() + "}";
     }
 
     public String getMediatorClassName() {

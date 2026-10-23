@@ -36,7 +36,7 @@ import java.util.ServiceLoader;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Resolves a {@code <streamPipeline>} child element to a {@link StreamOperator}.
+ * Resolves a {@code <streamSequence>} child element to a {@link StreamOperator}.
  * <p>
  * Mirrors {@code MediatorFactoryFinder}'s shape — a built-in table plus {@code ServiceLoader} — with
  * one addition that matters more than it looks: it also scans <b>deployed library classloaders</b>,
@@ -52,12 +52,12 @@ import java.util.concurrent.ConcurrentHashMap;
  *       miss rather than at construction, because connectors deploy after this finder first exists.
  *       {@code GenericProcessor} performs the same walk for inbound endpoint classes.</li>
  * </ol>
- * Pass 3 is why {@code STREAM_PIPELINE_TYPE} must be ordered after {@code SYNAPSE_LIBRARY_TYPE} in
- * the CApp deployment sequence: a pipeline deployed before its operators' connector has nothing to
+ * Pass 3 is why {@code STREAM_SEQUENCE_TYPE} must be ordered after {@code SYNAPSE_LIBRARY_TYPE} in
+ * the CApp deployment sequence: a sequence deployed before its operators' connector has nothing to
  * resolve against.
  *
  * <h2>Lookup is by QName, with a localName fallback</h2>
- * A pipeline's children normally inherit the Synapse namespace from the artifact root, but a
+ * A sequence's children normally inherit the Synapse namespace from the artifact root, but a
  * hand-written artifact may omit it. Rather than fail on something that is obviously intended, an
  * exact-QName miss falls back to matching on local name — and only when exactly one registered
  * factory claims that local name, so the fallback can never silently pick the wrong operator.
@@ -171,20 +171,12 @@ public class StreamOperatorFactoryFinder {
     }
 
     /**
-     * Builds the operator for an element.
-     *
-     * @param elem       the pipeline child element
-     * @param properties deployment properties
-     * @return the operator; never {@code null}
-     * @throws StreamException if no factory handles this element, or the factory rejects it
-     */
-    /**
      * Whether an operator element could be built right now, without building it.
      *
      * <p>Exists for one reason: a connector's operators are not on any classloader until the library
-     * deployer has run, and that happens <b>after</b> the Synapse configuration is parsed. So a pipeline
+     * deployer has run, and that happens <b>after</b> the Synapse configuration is parsed. So a sequence
      * naming {@code <file.streamRead>} cannot be resolved at parse time however hard we try. The factory
-     * uses this to notice the case and defer the whole pipeline to {@code init()}, which does run after
+     * uses this to notice the case and defer the whole sequence to {@code init()}, which does run after
      * libraries are deployed.
      *
      * @param tag the element's qualified name
@@ -201,6 +193,14 @@ public class StreamOperatorFactoryFinder {
         return resolve(tag) != null;
     }
 
+     /**
+     * Builds the operator for an element.
+     *
+     * @param elem       the sequence child element
+     * @param properties deployment properties
+     * @return the operator; never {@code null}
+     * @throws StreamException if no factory handles this element, or the factory rejects it
+     */
     public StreamOperator getOperator(OMElement elem, Properties properties) throws StreamException {
         if (elem == null) {
             throw new StreamException("cannot resolve a null element to a stream operator");

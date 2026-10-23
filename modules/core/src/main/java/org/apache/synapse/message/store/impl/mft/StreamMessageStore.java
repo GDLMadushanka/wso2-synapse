@@ -27,9 +27,9 @@ import org.apache.synapse.message.MessageConsumer;
 import org.apache.synapse.message.MessageProducer;
 import org.apache.synapse.message.store.AbstractMessageStore;
 import org.apache.synapse.stream.StreamException;
-import org.apache.synapse.stream.Transfer;
-import org.apache.synapse.stream.TransferStore;
-import org.apache.synapse.stream.TransferStores;
+import org.apache.synapse.stream.transfer.Transfer;
+import org.apache.synapse.stream.transfer.TransferStore;
+import org.apache.synapse.stream.transfer.TransferStores;
 
 import java.util.Collections;
 import java.util.List;
@@ -65,9 +65,9 @@ import java.util.List;
  * Both throw, and the asymmetry with every other message store is the point: <b>a transfer is not a
  * message</b>. A submission carries a connection name and a path — values an operator will read — and no
  * payload at all; a claimed transfer is a descriptor and an id, not something to mediate. Submitting goes
- * through {@code <mftSubmit>}, which can hand the job id back to its caller, and claiming goes through
- * the processor's own task. Accepting an arbitrary {@code MessageContext} here would queue something
- * nothing can execute.
+ * through {@code <store type="MFT">}, which can hand the job id back to its caller, and claiming goes
+ * through the processor's own task. Accepting an arbitrary {@code MessageContext} here would queue
+ * something nothing can execute.
  */
 public class StreamMessageStore extends AbstractMessageStore {
 
@@ -115,18 +115,19 @@ public class StreamMessageStore extends AbstractMessageStore {
     }
 
     /**
-     * @return a producer that turns a stored message into a queued transfer
+     * @throws SynapseException always
      *
-     * <p>This is how a transfer is submitted: {@code <store messageStore="mft-queue"/>}, with the body
-     * saying what to move. MI already has a mechanism for putting something into a message store, and
-     * inventing a second one for this store alone would be a parallel artifact for no gain (ADR-0043).
+     * <p>A producer is handed a <b>clone</b> of the message and returns a boolean, so an id computed
+     * here could never reach the caller — and an asynchronous transfer whose id is never returned
+     * cannot be polled, which is the whole point of queuing it. Submission therefore goes through
+     * {@code <store type="MFT">}, which sets the id on the submitting message itself.
      */
     @Override
     public MessageProducer getProducer() {
         throw new SynapseException("message store '" + getName() + "' is an MFT transfer queue and does"
-                + " not accept messages. Submit a transfer with <mftSubmit store=\"" + getName()
-                + "\">, which records the values the pipeline needs and hands back a job id; a message"
-                + " carries neither");
+                + " not accept messages. Add type=\"MFT\" to the <store messageStore=\"" + getName()
+                + "\"/> that reached here: it records the values the sequence needs and hands back a job"
+                + " id, where storing a message carries neither");
     }
 
     @Override

@@ -50,7 +50,7 @@ import static org.junit.Assert.fail;
  * The library-classloader pass is the one that matters. It is the only route by which an operator
  * shipped inside an MI connector becomes visible, and it runs lazily — so it is the thing most likely
  * to be silently broken by a change in ordering or classloader parentage. Everything else in the
- * pipeline plumbing depends on it working.
+ * sequence plumbing depends on it working.
  */
 public class StreamOperatorFactoryFinderTest {
 

@@ -18,26 +18,6 @@
 
 package org.apache.synapse.message.processor.impl.mft;
 
-import org.apache.axis2.context.ConfigurationContext;
-import org.apache.axis2.engine.AxisConfiguration;
-import org.apache.synapse.SynapseConstants;
-import org.apache.synapse.config.SynapseConfiguration;
-import org.apache.synapse.core.SynapseEnvironment;
-import org.apache.synapse.core.axis2.Axis2SynapseEnvironment;
-import org.apache.synapse.message.processor.impl.AbstractMessageProcessor;
-import org.apache.synapse.stream.Transfer;
-import org.apache.synapse.stream.TransferStatus;
-import org.apache.synapse.stream.TransferStore;
-import org.apache.synapse.stream.TransferStores;
-import org.apache.synapse.stream.StreamContext;
-import org.apache.synapse.stream.StreamException;
-import org.apache.synapse.stream.StreamSink;
-import org.apache.synapse.stream.StreamSource;
-import org.apache.synapse.stream.pipeline.StreamPipeline;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
-
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -46,7 +26,26 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-
+import org.apache.axis2.context.ConfigurationContext;
+import org.apache.axis2.engine.AxisConfiguration;
+import org.apache.synapse.SynapseConstants;
+import org.apache.synapse.config.SynapseConfiguration;
+import org.apache.synapse.core.SynapseEnvironment;
+import org.apache.synapse.core.axis2.Axis2SynapseEnvironment;
+import org.apache.synapse.message.processor.impl.AbstractMessageProcessor;
+import org.apache.synapse.stream.StreamContext;
+import org.apache.synapse.stream.StreamException;
+import org.apache.synapse.stream.StreamSink;
+import org.apache.synapse.stream.StreamSource;
+import org.apache.synapse.stream.sequence.StreamSequence;
+import org.apache.synapse.stream.transfer.Submission;
+import org.apache.synapse.stream.transfer.Transfer;
+import org.apache.synapse.stream.transfer.TransferStatus;
+import org.apache.synapse.stream.transfer.TransferStore;
+import org.apache.synapse.stream.transfer.TransferStores;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -100,7 +99,7 @@ public class MFTTransferServiceTest {
 
         runOnce();
 
-        assertEquals("the pipeline must have run", 1, sink.consumed.get());
+        assertEquals("the sequence must have run", 1, sink.consumed.get());
         assertTrue("a transfer that finished has nothing to put back", queue.requeued.isEmpty());
     }
 
@@ -109,7 +108,7 @@ public class MFTTransferServiceTest {
      * incoming message, so a connector operation has nowhere else to read a path from.
      */
     @Test
-    public void theDescriptorsParametersReachThePipelineAsProperties() throws Exception {
+    public void theDescriptorsParametersReachTheSequenceAsProperties() throws Exception {
         RecordingSink sink = new RecordingSink();
         deploy("copy", sink, null);
         Map<String, String> parameters = new LinkedHashMap<>();
@@ -165,15 +164,15 @@ public class MFTTransferServiceTest {
     }
 
     /**
-     * A processor pointed at a pipeline that is not deployed is a recoverable state: deploy it and the
+     * A processor pointed at a sequence that is not deployed is a recoverable state: deploy it and the
      * next attempt runs. Failing the transfer outright would make a deployment-ordering mistake
      * permanent.
      */
     @Test
-    public void aMissingPipelineIsRequeuedRatherThanFailed() throws Exception {
+    public void aMissingSequenceIsRequeuedRatherThanFailed() throws Exception {
         queue.waiting.add(transfer(1, Map.of()));
 
-        runOnce(Map.of("pipeline", "not-deployed"));
+        runOnce(Map.of("streamSequence", "not-deployed"));
 
         assertEquals(1, queue.requeued.size());
         assertEquals(1L, queue.requeued.get(0).jobId);
@@ -198,7 +197,7 @@ public class MFTTransferServiceTest {
 
     // ------------------------------------------------------------------ hooks and deactivation
 
-    /** Where "email me when the transfer finishes" lives. Nothing in a pipeline can express it. */
+    /** Where "email me when the transfer finishes" lives. Nothing in a sequence can express it. */
     @Test
     public void aSuccessfulTransferRunsTheSuccessSequence() throws Exception {
         deploy("copy", new RecordingSink(), null);
@@ -328,7 +327,7 @@ public class MFTTransferServiceTest {
 
     private MFTTransferService serviceWith(Map<String, Object> parameters) {
         parameters.putIfAbsent("client.retry.interval", "1000");
-        parameters.putIfAbsent("pipeline", "copy");
+        parameters.putIfAbsent("streamSequence", "copy");
         lastProcessor = new FakeProcessor(parameters);
         return new MFTTransferService(lastProcessor, environment, "concurrency", "max.delivery.attempts",
                 "client.retry.interval");
@@ -347,12 +346,12 @@ public class MFTTransferServiceTest {
     }
 
     private void deploy(String name, StreamSink sink, String ignored) throws Exception {
-        StreamPipeline pipeline = new StreamPipeline();
-        pipeline.setName(name);
-        pipeline.addOperator(new BytesSource(), true);
-        pipeline.addOperator(sink, true);
-        pipeline.validate();
-        config.addStreamPipeline(name, pipeline);
+        StreamSequence sequence = new StreamSequence();
+        sequence.setName(name);
+        sequence.addOperator(new BytesSource(), true);
+        sequence.addOperator(sink, true);
+        sequence.validate();
+        config.addStreamSequence(name, sequence);
     }
 
     private static Transfer transfer(long jobId, Map<String, String> parameters, int attempt) {
@@ -376,13 +375,13 @@ public class MFTTransferServiceTest {
         private final List<String> linked = java.util.Collections.synchronizedList(new ArrayList<>());
 
         @Override
-        public org.apache.synapse.stream.Submission submit(String storeName,
+        public Submission submit(String storeName,
                                                            Map<String, String> parameters,
                                                            String idempotencyKey,
                                                            String submitter) {
             long jobId = waiting.size() + 1L;
             waiting.add(transfer(jobId, parameters, 0));
-            return new org.apache.synapse.stream.Submission(jobId, true);
+            return new Submission(jobId, true);
         }
 
         @Override
@@ -391,12 +390,12 @@ public class MFTTransferServiceTest {
         }
 
         @Override
-        public org.apache.synapse.stream.TransferStatus requestPause(long jobId) {
+        public org.apache.synapse.stream.transfer.TransferStatus requestPause(long jobId) {
             return null;
         }
 
         @Override
-        public org.apache.synapse.stream.TransferStatus requestStop(long jobId) {
+        public org.apache.synapse.stream.transfer.TransferStatus requestStop(long jobId) {
             return null;
         }
 
@@ -406,7 +405,7 @@ public class MFTTransferServiceTest {
         }
 
         @Override
-        public org.apache.synapse.stream.TransferStatus stopped(long jobId) {
+        public org.apache.synapse.stream.transfer.TransferStatus stopped(long jobId) {
             stoppedCalls.add(jobId);
             return null;
         }

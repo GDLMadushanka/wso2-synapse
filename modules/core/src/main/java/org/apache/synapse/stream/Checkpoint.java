@@ -87,7 +87,7 @@ import java.nio.charset.StandardCharsets;
  * @param payload       operator-owned state, or {@code null}; at most
  *                      {@value #MAX_PAYLOAD_BYTES} bytes of UTF-8
  */
-public record Checkpoint(long position, long outputLength, CheckpointUnit unit, String formatVersion,
+public record Checkpoint(long position, long outputLength, String unit, String formatVersion,
                          String payload) {
 
     /**
@@ -135,7 +135,7 @@ public record Checkpoint(long position, long outputLength, CheckpointUnit unit, 
      * @param unit          what {@code position} counts
      * @param formatVersion the operator's own format tag
      */
-    public Checkpoint(long position, long outputLength, CheckpointUnit unit, String formatVersion) {
+    public Checkpoint(long position, long outputLength, String unit, String formatVersion) {
         this(position, outputLength, unit, formatVersion, null);
     }
 }

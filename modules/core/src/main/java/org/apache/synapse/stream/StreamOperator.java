@@ -19,10 +19,10 @@
 package org.apache.synapse.stream;
 
 /**
- * Base contract for a link in a {@code <streamPipeline>} byte chain.
+ * Base contract for a link in a {@code <streamSequence>} byte chain.
  * <p>
  * An operator is <b>not a mediator</b>. It contributes a link to a lazy chain and does not run
- * when it is invoked; the pipeline's sink is the only participant that reads, and all execution
+ * when it is invoked; the sequence's sink is the only participant that reads, and all execution
  * happens inside that read loop.
  * <p>
  * Every operator implements <b>exactly one</b> of {@link StreamSource}, {@link StreamTransform}
@@ -68,29 +68,6 @@ public interface StreamOperator {
     String name();
 
     /**
-     * Whether this operator produces <b>byte-identical output for byte-identical input</b>.
-     * <p>
-     * Strictly that, and not "logically equivalent" or "the same records". Two mechanisms depend
-     * on this flag and only the strict reading serves both: reuse of a spilled artifact needs
-     * byte-identity, and record-count skip-forward needs record boundaries to fall in the same
-     * places. An operator that emitted the same records in a different order would satisfy a
-     * loose reading and would silently break resume, because "record 51" would be a different
-     * record.
-     * <p>
-     * <b>This is the one method in the contract whose misuse causes silent data corruption
-     * rather than an error.</b> A wrong {@code false} costs re-derivation; a wrong {@code true}
-     * produces a plausible, complete, wrong result. Return {@code false} when uncertain.
-     * <p>
-     * Not deterministic, despite appearances: reading a remote path whose object may change;
-     * stamping a timestamp, hostname or UUID; anything depending on the iteration order of an
-     * unordered collection; anything whose output a remote call decides.
-     * <p>
-     * Any implementation returning {@code true} should state in its class javadoc why it is
-     * entitled to.
-     *
-     * @return {@code true} only if output is byte-identical for identical input, always
-     */
-    /**
      * Checks the configuration a deployer wrote, at <b>deployment</b>, before any file is touched.
      *
      * <h2>Why this exists</h2>
@@ -124,7 +101,7 @@ public interface StreamOperator {
      * Whether this operator produces <b>byte-identical output for byte-identical input</b>.
      *
      * <p>Strictly that, and not "logically equivalent". The framework uses it for one thing: a stage
-     * that {@link #checkpointed()} may only sit below a {@link #materialises()} stage that is
+     * that {@link #checkpointed()} may only sit downstream of a {@link #materialises()} stage that is
      * deterministic, because a failure re-derives the materialising stage's unpersisted tail and, if
      * that tail may differ, the checkpointed stage's recorded position would skip records of different
      * bytes — silently, and undetectably afterwards (ADR-0034).
@@ -152,7 +129,7 @@ public interface StreamOperator {
      * <p>Declaring this lets a {@code deterministic="true|false"} stage attribute settle it, and the
      * attribute is <b>refused at deployment on any operator that does not</b> — so the choice is
      * offered exactly where someone is in a position to make it. The same question ADR-0025 settled for
-     * {@code maxReprocessed}: not "is this configurable" but "who can possibly know".
+     * {@code checkpointFrequency}: not "is this configurable" but "who can possibly know".
      *
      * <p>Declaring it changes nothing on its own. With no attribute, {@link #deterministic()} still
      * decides.
@@ -179,7 +156,7 @@ public interface StreamOperator {
      * <p>
      * Declaring this entitles the operator to {@link StreamContext#workspace()} and makes it the
      * last stage of its restart segment. Return {@code true} even when the write is conditional
-     * — on an input size threshold, say — because the pipeline's check is static and cannot see
+     * — on an input size threshold, say — because the sequence's check is static and cannot see
      * the condition. Transient in-memory buffering is not materialisation.
      *
      * @return {@code true} if this operator writes a durable artifact

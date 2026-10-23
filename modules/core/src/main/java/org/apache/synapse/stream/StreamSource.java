@@ -23,9 +23,9 @@ import java.io.InputStream;
 /**
  * Head of a byte chain: produces a stream without reading it.
  * <p>
- * Exactly one source per pipeline, and it is first — unless the pipeline declares
+ * Exactly one source per sequence, and it is first — unless the sequence declares
  * {@code sourceProvided="true"}, in which case the caller supplies a {@link StreamSeed} and the
- * pipeline has no source at all.
+ * sequence has no source at all.
  *
  * @see StreamOperator
  */
@@ -53,35 +53,6 @@ public interface StreamSource extends StreamOperator {
      */
     InputStream open(StreamContext ctx) throws StreamException;
 
-    /**
-     * Whether a later attempt can obtain these bytes again.
-     *
-     * <p>This decides whether a run over this source is <b>durable</b> or <b>ephemeral</b>, so it is
-     * the one capability that cannot live on the pipeline: the same pipeline is resumable when fed a
-     * file and not resumable when fed a request body.
-     *
-     * <p><b>The default is {@link StreamOrigin#REOPENABLE}, which breaks the convention that every
-     * capability defaults to the cautious answer.</b> That is deliberate, and the reasoning is worth
-     * stating because it is the opposite of the neighbouring flags:
-     *
-     * <ul>
-     *   <li>Wrongly defaulting to {@code ONE_SHOT} would <b>silently</b> take resume away from a
-     *       500 GB file transfer. Nothing fails; the transfer simply starts from zero every time it
-     *       is retried, and no message says why.</li>
-     *   <li>Wrongly declaring {@code REOPENABLE} fails <b>loudly</b>: the second attempt tries to
-     *       re-open, cannot, and reports it. Nothing is silently lost.</li>
-     * </ul>
-     *
-     * Between a silent and a loud failure the loud one wins, and file-like sources — the
-     * overwhelming majority — are genuinely re-openable. So silence means re-openable here, where
-     * for {@code deterministic()} silence means the safe {@code false}.
-     *
-     * <p>Declare {@code ONE_SHOT} if your bytes arrive on a connection you do not control: a
-     * multipart request body, a socket, a pipe. If you are unsure, you are probably re-openable —
-     * the test is whether {@code open()} called tomorrow could return the same bytes.
-     *
-     * @return whether these bytes can be obtained again; never {@code null}
-     */
     /**
      * Whether this source can begin at a byte offset instead of at the start.
      *
@@ -120,7 +91,7 @@ public interface StreamSource extends StreamOperator {
      * until the first {@code read()} — by which time the workspace has been chosen and a previous
      * attempt's artifacts may already have been adopted. With it, a second attempt over a <i>replaced</i>
      * resource is caught before it can splice two sources into one artifact, and
-     * {@code sourceIdentity="strict"} means something on a pipeline that opens its own source.
+     * {@code sourceIdentity="strict"} means something on a sequence that opens its own source.
      *
      * <h2>Returning null is fine</h2>
      * The default. A source that cannot identify a resource cheaply should say so rather than guess: the
@@ -128,7 +99,7 @@ public interface StreamSource extends StreamOperator {
      * <b>not</b> fine is an identity that two different resources could share — see
      * {@link SourceIdentity}.
      *
-     * <p>Called only when the answer can change something: a pipeline keeping durable state, with the
+     * <p>Called only when the answer can change something: a sequence keeping durable state, with the
      * source-identity guard on. A scratch run pays no round trip.
      *
      * @param ctx everything this operator gets for this one invocation

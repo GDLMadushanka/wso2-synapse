@@ -31,7 +31,7 @@ import java.util.List;
 /**
  * Owns every handle a run opens, and closes them last-in-first-out.
  * <p>
- * One scope per run, created by the pipeline and reached through
+ * One scope per run, created by the sequence and reached through
  * {@link StreamContext#resources()}. No operator can own this itself: a transform does not know
  * whether the sink is still reading from it, and {@code try-with-resources} inside an operator is
  * actively wrong, because the resource must outlive the method that created it — the stream is
@@ -157,9 +157,9 @@ public class ResourceScope implements Closeable {
      * Releases every resource registered before a watermark, newest of those first.
      *
      * <p>This is what actually frees a resumed run's orphaned upstream, and it exists because
-     * {@link #closeNow} could not. The pipeline holds {@code StageStream} decorators, not the streams
+     * {@link #closeNow} could not. The sequence holds {@code StageStream} decorators, not the streams
      * operators registered here, so matching by identity found nothing and released nothing — while
-     * logging that it had. What the pipeline does know is <b>when</b>: everything registered before the
+     * logging that it had. What the sequence does know is <b>when</b>: everything registered before the
      * stage that resumed belongs to a segment nothing will read.
      *
      * <p>Committing resources among them are aborted rather than closed, for the reason
@@ -210,37 +210,6 @@ public class ResourceScope implements Closeable {
     }
 
     /**
-     * Closes every registered resource, last-registered first.
-     * <p>
-     * <b>Attempts all of them</b>, even if an earlier close threw — abandoning the remainder on
-     * first failure would leak precisely the handles most likely to matter. Failures of
-     * {@link #register}ed resources are logged and swallowed. Failures of
-     * {@link #registerCommitting} resources are collected; if there are any, the first is thrown
-     * with the rest attached as suppressed.
-     * <p>
-     * <b>Caller obligation on the failure path.</b> When the run is already failing, the caller
-     * must not let a commit failure replace the original exception — the original is the
-     * diagnosis and the commit failure is a consequence of it. Catch and attach:
-     * <pre>
-     *   try {
-     *       scope.close();
-     *   } catch (IOException commitFailure) {
-     *       primary.addSuppressed(commitFailure);
-     *   }
-     * </pre>
-     * Only the caller knows what the primary exception is, which is why that rule lives there and
-     * not here.
-     * <p>
-     * Idempotent: closing an already-closed scope does nothing. Mutually exclusive with
-     * {@link #abort()} — whichever runs first wins, and the other becomes a no-op.
-     *
-     * <p><b>This is the success path.</b> A committing resource is closed, which publishes its
-     * work. A run that failed must call {@link #abort()} instead, or it publishes a partial
-     * artifact under a name that means complete.
-     *
-     * @throws IOException if any committing resource failed to close
-     */
-    /**
      * Unwinds after a <b>failed or cancelled</b> run: releases every resource and publishes none.
      *
      * <p>Same LIFO order and same all-or-nothing attempt as {@link #close()}, with one difference
@@ -273,6 +242,37 @@ public class ResourceScope implements Closeable {
         }
     }
 
+     /**
+     * Closes every registered resource, last-registered first.
+     * <p>
+     * <b>Attempts all of them</b>, even if an earlier close threw — abandoning the remainder on
+     * first failure would leak precisely the handles most likely to matter. Failures of
+     * {@link #register}ed resources are logged and swallowed. Failures of
+     * {@link #registerCommitting} resources are collected; if there are any, the first is thrown
+     * with the rest attached as suppressed.
+     * <p>
+     * <b>Caller obligation on the failure path.</b> When the run is already failing, the caller
+     * must not let a commit failure replace the original exception — the original is the
+     * diagnosis and the commit failure is a consequence of it. Catch and attach:
+     * <pre>
+     *   try {
+     *       scope.close();
+     *   } catch (IOException commitFailure) {
+     *       primary.addSuppressed(commitFailure);
+     *   }
+     * </pre>
+     * Only the caller knows what the primary exception is, which is why that rule lives there and
+     * not here.
+     * <p>
+     * Idempotent: closing an already-closed scope does nothing. Mutually exclusive with
+     * {@link #abort()} — whichever runs first wins, and the other becomes a no-op.
+     *
+     * <p><b>This is the success path.</b> A committing resource is closed, which publishes its
+     * work. A run that failed must call {@link #abort()} instead, or it publishes a partial
+     * artifact under a name that means complete.
+     *
+     * @throws IOException if any committing resource failed to close
+     */
     @Override
     public void close() throws IOException {
         if (closed) {

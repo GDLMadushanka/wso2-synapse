@@ -27,8 +27,8 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.Mediator;
 import org.apache.synapse.Startup;
 import org.apache.synapse.SynapseConstants;
-import org.apache.synapse.config.xml.stream.StreamPipelineFactory;
-import org.apache.synapse.stream.pipeline.StreamPipeline;
+import org.apache.synapse.config.xml.stream.StreamSequenceFactory;
+import org.apache.synapse.stream.sequence.StreamSequence;
 import org.apache.synapse.SynapseException;
 import org.apache.synapse.commons.executors.PriorityExecutor;
 import org.apache.synapse.commons.executors.config.PriorityExecutorFactory;
@@ -115,12 +115,12 @@ public class SynapseXMLConfigurationFactory implements ConfigurationFactory {
                     defineAPI(config, elt, properties);
                 } else if (XMLConfigConstants.DESCRIPTION_ELT.equals(elt.getQName())) {
                     config.setDescription(elt.getText());
-                } else if (XMLConfigConstants.STREAM_PIPELINE_ELT.equals(elt.getQName())) {
+                } else if (XMLConfigConstants.STREAM_SEQUENCE_ELT.equals(elt.getQName())) {
                 String key = elt.getAttributeValue(new QName(XMLConfigConstants.NULL_NAMESPACE, "key"));
                 if (key != null) {
-                    handleException("Referred stream pipelines are not allowed at the top level");
+                    handleException("Referred stream sequences are not allowed at the top level");
                 } else {
-                    defineStreamPipeline(config, elt, properties);
+                    defineStreamSequence(config, elt, properties);
                 }
             } else if (XMLConfigConstants.INBOUND_ENDPOINT_ELT.equals(elt.getQName())) {
                     defineInboundEndpoint(config, elt, properties);
@@ -464,18 +464,18 @@ public class SynapseXMLConfigurationFactory implements ConfigurationFactory {
         }
     }
 
-    public static StreamPipeline defineStreamPipeline(SynapseConfiguration config, OMElement elem,
+    public static StreamSequence defineStreamSequence(SynapseConfiguration config, OMElement elem,
                                                      Properties properties) {
-        StreamPipeline pipeline = null;
+        StreamSequence sequence = null;
         try {
-            pipeline = StreamPipelineFactory.createStreamPipeline(elem, properties);
-            config.addStreamPipeline(pipeline.getName(), pipeline);
-            log.info("Successfully created Stream Pipeline: " + pipeline.getName());
+            sequence = StreamSequenceFactory.createStreamSequence(elem, properties);
+            config.addStreamSequence(sequence.getName(), sequence);
+            log.info("Successfully created Stream Sequence: " + sequence.getName());
         } catch (Exception e) {
-            String msg = "Stream pipeline configuration cannot be built";
-            handleConfigurationError(SynapseConstants.FAIL_SAFE_MODE_STREAM_PIPELINES, msg, e);
+            String msg = "Stream sequence configuration cannot be built";
+            handleConfigurationError(SynapseConstants.FAIL_SAFE_MODE_STREAM_SEQUENCES, msg, e);
         }
-        return pipeline;
+        return sequence;
     }
 
     public static InboundEndpoint defineInboundEndpoint(SynapseConfiguration config, OMElement elem, Properties properties) {

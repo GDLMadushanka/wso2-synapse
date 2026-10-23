@@ -196,12 +196,12 @@ public final class SynapseConstants {
         /** service type param value for the proxy services */
         public static final String PROXY_SERVICE_TYPE = "proxy";
 
-        /** Artifact type used in formatted log lines: {@code {streamPipeline:name} …}. */
-        public static final String STREAM_PIPELINE_TYPE = "streamPipeline";
+        /** Artifact type used in formatted log lines: {@code {streamSequence:name} …}. */
+        public static final String STREAM_SEQUENCE_TYPE = "streamSequence";
 
         /**
          * Root directory under which a run's materialised artifacts are written, from
-         * synapse.properties. Absent means materialisation is not permitted, and a pipeline needing
+         * synapse.properties. Absent means materialisation is not permitted, and a sequence needing
          * it is rejected at deployment rather than failing hours into a transfer.
          */
         public static final String STREAM_WORKSPACE_ROOT = "mft.workspace.root";
@@ -562,7 +562,7 @@ public final class SynapseConstants {
     public static final String FAIL_SAFE_MODE_MESSAGE_STORES = "messagestores";
     public static final String FAIL_SAFE_MODE_API = "api";
     public static final String FAIL_SAFE_MODE_INBOUND_ENDPOINT = "inboundendpoint";
-    public static final String FAIL_SAFE_MODE_STREAM_PIPELINES = "streampipelines";
+    public static final String FAIL_SAFE_MODE_STREAM_SEQUENCES = "streampipelines";
     public static final String FAIL_SAFE_MODE_IMPORTS = "import";
     public static final String FAIL_SAFE_MODE_TASKS = "task";
     public static final String FAIL_SAFE_MODE_REGISTRY = "registry";

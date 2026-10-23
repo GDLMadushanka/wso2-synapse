@@ -25,7 +25,7 @@ import java.io.InputStream;
  * A stage's durable state: the artifact it writes, the position it resumes from, and the coupling
  * between them.
  *
- * <h2>Why this exists rather than a {@code Path} and a {@link CheckpointStore}</h2>
+ * <h2>Why this exists rather than a {@code Path} and a {@link org.apache.synapse.stream.spi.CheckpointStore CheckpointStore}</h2>
  * Those two primitives left <b>six</b> obligations with the operator author, every one of them
  * unenforced and every one of them silent when broken: write only under the stage directory, write to
  * a temporary name, keep the final name stable across runs, {@code fsync} before the position moves,
@@ -108,7 +108,7 @@ public interface StageArtifact {
      * Opens the completed artifact. The returned stream is registered with the run's resource scope.
      *
      * <h2>Only the canonical artifact reports a short-circuit</h2>
-     * Opening {@link StreamContext#artifact() the canonical artifact} tells the pipeline this
+     * Opening {@link StreamContext#artifact() the canonical artifact} tells the sequence this
      * <b>stage</b> produced its output from a previous run, which releases the upstream stages built
      * above it that will now never be read. Doing that here rather than asking the operator to
      * remember is the point: forgetting it holds a remote connection open and unread for the length of
@@ -152,6 +152,42 @@ public interface StageArtifact {
     long resumePosition() throws IOException;
 
     /**
+     * Where to resume when the output is somewhere this process cannot see.
+     *
+     * <p>The external counterpart to {@link #resumePosition()}, which answers from the checkpoint
+     * alone. That is enough for a materialising stage, whose artifact the framework owns and sizes
+     * itself. It is not enough for a sink writing to a remote destination, because the checkpoint is
+     * a claim about something only the destination can confirm.
+     *
+     * <pre>
+     *   claimed = this stage's checkpoint      the authority, and never ahead unless something broke
+     *   actual  = destination.durablePosition()  reality, usually ahead because the checkpoint is
+     *                                            written after the work it describes
+     *
+     *   actual &lt; claimed  →  the checkpoint is lying. Resume at actual, never at claimed
+     *   actual &gt; claimed  →  discardAbove(claimed); the surplus was never recorded and is about
+     *                         to be produced again
+     * </pre>
+     *
+     * <p><b>Note how this differs from the local case.</b> When a materialising stage's artifact is
+     * shorter than its checkpoint, the framework discards the checkpoint and restarts the segment:
+     * there the position and the artifact length are two halves of one record, so a short artifact
+     * invalidates the position too. Here the position <i>is</i> the destination's state, so there is
+     * nothing to invalidate — resuming at what the destination actually holds is exactly right, and
+     * restarting from zero would re-send work that is provably already there.
+     *
+     * @param destination the sink's own view of where its output really got to
+     * @param discard     whether to cut the destination back when it holds more than was recorded.
+     *                    {@code false} answers the same question without touching anything, which is
+     *                    what {@link StreamSink#durableByteOffset} needs — it is asked before the run
+     *                    starts, to tell a seekable source where to begin, and must not mutate the
+     *                    destination as a side effect of being asked
+     * @return the position both sides agree on, in this stage's checkpoint unit; {@code 0} to start
+     *         from the beginning
+     */
+    long resumeAgainst(StageDestination destination, boolean discard) throws IOException;
+
+    /**
      * Opens the part of this artifact a previous attempt already produced, so a resumed stage can
      * hand its downstream the <b>whole</b> output stream rather than only the tail.
      *
@@ -161,7 +197,7 @@ public interface StageArtifact {
      * the end of a short stream, or over different records — and rows would vanish with the run
      * reporting success. Every materialising transform needs this, forgetting it is silent data loss,
      * and by the argument in this interface's own javadoc that makes it the framework's obligation
-     * rather than an author's. {@code StreamPipeline} concatenates it ahead of the operator's stream;
+     * rather than an author's. {@code StreamSequence} concatenates it ahead of the operator's stream;
      * no operator calls it.
      *
      * <h2>It reconciles first</h2>
@@ -175,7 +211,7 @@ public interface StageArtifact {
      * are the same bytes the operator is about to produce again.
      *
      * <p>Performs I/O, so unlike {@link #isComplete()} it must not be called during the build phase —
-     * see invariant 1. The pipeline defers it to the first {@code read()}.
+     * see invariant 1. The sequence defers it to the first {@code read()}.
      *
      * @return a stream over the already-produced output; empty when there is none
      * @throws IOException if the artifact could not be reconciled or opened
@@ -212,11 +248,11 @@ public interface StageArtifact {
      * {@code (position, artifact length, unit, format version)}. When one is not due it returns
      * having done nothing durable, which is exactly what the deployer asked for: the bytes appended
      * since the last checkpoint are truncated away on resume, so they need no {@code fsync} of their
-     * own. That is the whole of why {@code maxReprocessed} is the only lever on throughput here.
+     * own. That is the whole of why {@code checkpointFrequency} is the only lever on throughput here.
      *
      * <h2>Cadence, and why coarse reporting is safe</h2>
      * A checkpoint is due when {@code position} has advanced by at least the stage's
-     * {@code maxReprocessed} since the last one. An operator that reports finely gets exactly the
+     * {@code checkpointFrequency} since the last one. An operator that reports finely gets exactly the
      * bound the deployer asked for. An operator that reports coarsely — a byte copier calling once
      * per block — checkpoints on every call, which is as close to the bound as its own granularity
      * allows, and the framework logs once when it cannot honour the bound rather than silently
@@ -277,6 +313,25 @@ public interface StageArtifact {
     long length() throws IOException;
 
     /**
+     * Records the position already earned, without waiting for {@code checkpointFrequency} to come round.
+     *
+     * <p>For a stop the deployer asked for — a shutdown, a cancellation. {@code unitDone} normally skips
+     * the checkpoint while fewer than {@code checkpointFrequency} units have passed, so a run stopped between
+     * intervals would replay units it had genuinely finished. This writes what is owed and nothing more:
+     * the position it records is the last unit that <b>completed</b>, so it is safe at any moment.
+     *
+     * <p>Costs one fsync, and turns "wait for the next checkpoint" into "stop at the next unit" — the
+     * difference between a shutdown delayed by an interval and one delayed by a record. Called by the
+     * framework at the end of a cancelled run, not by operators: see ADR-0037.
+     *
+     * <p>Does nothing for an artifact with no checkpoint store, and nothing when the position has not
+     * moved since the last checkpoint.
+     *
+     * @throws IOException if the artifact could not be made durable; the position is then not advanced
+     */
+    void flushPosition() throws IOException;
+
+    /**
      * Finishes a <b>named</b> working file now, making it complete and readable within this run.
      *
      * <p>Flushes, {@code fsync}s and renames it into place, exactly as a successful run would — but
@@ -304,24 +359,25 @@ public interface StageArtifact {
      * @throws IOException           if the file could not be made durable or renamed
      * @throws IllegalStateException if called on the canonical artifact rather than a named one
      */
-    /**
-     * Records the position already earned, without waiting for {@code maxReprocessed} to come round.
-     *
-     * <p>For a stop the deployer asked for — a shutdown, a cancellation. {@code unitDone} normally skips
-     * the checkpoint while fewer than {@code maxReprocessed} units have passed, so a run stopped between
-     * intervals would replay units it had genuinely finished. This writes what is owed and nothing more:
-     * the position it records is the last unit that <b>completed</b>, so it is safe at any moment.
-     *
-     * <p>Costs one fsync, and turns "wait for the next checkpoint" into "stop at the next unit" — the
-     * difference between a shutdown delayed by an interval and one delayed by a record. Called by the
-     * framework at the end of a cancelled run, not by operators: see ADR-0037.
-     *
-     * <p>Does nothing for an artifact with no checkpoint store, and nothing when the position has not
-     * moved since the last checkpoint.
-     *
-     * @throws IOException if the artifact could not be made durable; the position is then not advanced
-     */
-    void flushPosition() throws IOException;
-
     void seal() throws IOException;
+
+    /**
+     * Deletes this <b>named</b> working file and any partial behind it.
+     *
+     * <p>For a stage that must start over and must not read what a previous attempt left — an external
+     * merge sort beginning a fresh split, where a stale run file would be merged in as though this
+     * attempt had produced it.
+     *
+     * <p>Idempotent: discarding a file that is not there is not an error, because "make sure this is
+     * gone" is the caller's actual intent and a leftover from a half-finished attempt may or may not
+     * exist.
+     *
+     * <p><b>Refused on the canonical artifact</b>, for the same reason {@link #seal()} is. Whether the
+     * stage's own output survives is the run's outcome to decide; an operator deleting it would hide a
+     * completed segment from the next attempt, which would then redo work it could have skipped.
+     *
+     * @throws IOException           if the file exists and could not be removed
+     * @throws IllegalStateException if called on the canonical artifact rather than a named one
+     */
+    void discard() throws IOException;
 }

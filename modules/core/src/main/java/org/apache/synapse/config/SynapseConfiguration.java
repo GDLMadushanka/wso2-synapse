@@ -59,7 +59,7 @@ import org.apache.synapse.endpoints.Template;
 import org.apache.synapse.endpoints.dispatch.SALSessions;
 import org.apache.synapse.eventing.SynapseEventSource;
 import org.apache.synapse.inbound.InboundEndpoint;
-import org.apache.synapse.stream.pipeline.StreamPipeline;
+import org.apache.synapse.stream.sequence.StreamSequence;
 import org.apache.synapse.inbound.InboundEndpointConstants;
 import org.apache.synapse.libraries.imports.SynapseImport;
 import org.apache.synapse.libraries.model.Library;
@@ -212,15 +212,15 @@ public class SynapseConfiguration implements ManagedLifecycle, SynapseArtifact {
     private Map<String, InboundEndpoint> inboundEndpointMap = new ConcurrentHashMap<String, InboundEndpoint>();
 
     /**
-     * Deployed {@code <streamPipeline>} artifacts, by name.
+     * Deployed {@code <streamSequence>} artifacts, by name.
      * <p>
-     * A pipeline is not a {@code Mediator}, so unlike a sequence it does not live in
+     * A sequence is not a {@code Mediator}, so unlike a sequence it does not live in
      * {@code localRegistry} — it gets its own map, exactly as an inbound endpoint does. That also
      * means it inherits <b>no</b> lifecycle: see the explicit loops in {@link #init(SynapseEnvironment)}
-     * and {@link #destroy(boolean)}, without which a pipeline would register perfectly and never be
+     * and {@link #destroy(boolean)}, without which a sequence would register perfectly and never be
      * initialised.
      */
-    private Map<String, StreamPipeline> streamPipelineMap = new ConcurrentHashMap<String, StreamPipeline>();
+    private Map<String, StreamSequence> streamSequenceMap = new ConcurrentHashMap<String, StreamSequence>();
 
     /**
      * Contains APIs, mapped against inbound endpoint names to which they are bound to, as specified.
@@ -430,30 +430,30 @@ public class SynapseConfiguration implements ManagedLifecycle, SynapseArtifact {
 	}
 
 
-    public synchronized void addStreamPipeline(String name, StreamPipeline pipeline) {
-        if (streamPipelineMap.containsKey(name)) {
-            handleException("Duplicate stream pipeline definition for name : " + name);
+    public synchronized void addStreamSequence(String name, StreamSequence sequence) {
+        if (streamSequenceMap.containsKey(name)) {
+            handleException("Duplicate stream sequence definition for name : " + name);
         }
-        streamPipelineMap.put(name, pipeline);
+        streamSequenceMap.put(name, sequence);
     }
 
-    public StreamPipeline getStreamPipeline(String name) {
-        return streamPipelineMap.get(name);
+    public StreamSequence getStreamSequence(String name) {
+        return streamSequenceMap.get(name);
     }
 
-    public Collection<StreamPipeline> getStreamPipelines() {
-        return Collections.unmodifiableCollection(streamPipelineMap.values());
+    public Collection<StreamSequence> getStreamSequences() {
+        return Collections.unmodifiableCollection(streamSequenceMap.values());
     }
 
-    public synchronized void updateStreamPipeline(String name, StreamPipeline pipeline) {
-        if (!streamPipelineMap.containsKey(name)) {
-            handleException("No stream pipeline exists by the name : " + name);
+    public synchronized void updateStreamSequence(String name, StreamSequence sequence) {
+        if (!streamSequenceMap.containsKey(name)) {
+            handleException("No stream sequence exists by the name : " + name);
         }
-        streamPipelineMap.put(name, pipeline);
+        streamSequenceMap.put(name, sequence);
     }
 
-    public synchronized StreamPipeline removeStreamPipeline(String name) {
-        return streamPipelineMap.remove(name);
+    public synchronized StreamSequence removeStreamSequence(String name) {
+        return streamSequenceMap.remove(name);
     }
 
 	public Collection<InboundEndpoint> getInboundEndpoints() {
@@ -1700,12 +1700,12 @@ public class SynapseConfiguration implements ManagedLifecycle, SynapseArtifact {
             }
         }
 
-        // destroy the stream pipelines
-        for (StreamPipeline pipeline : streamPipelineMap.values()) {
+        // destroy the stream sequences
+        for (StreamSequence sequence : streamSequenceMap.values()) {
             try {
-                pipeline.destroy();
+                sequence.destroy();
             } catch (Exception e) {
-                log.error("Error in destroying Stream Pipeline [ " + pipeline.getName() + "] "
+                log.error("Error in destroying Stream Sequence [ " + sequence.getName() + "] "
                         + e.getMessage());
             }
         }
@@ -1862,14 +1862,14 @@ public class SynapseConfiguration implements ManagedLifecycle, SynapseArtifact {
 			}
         }
 
-        // initialize stream pipelines. A pipeline lives in its own map rather than in
+        // initialize stream sequences. A sequence lives in its own map rather than in
         // localRegistry, so nothing initialises it unless this loop does.
-        for (StreamPipeline pipeline : streamPipelineMap.values()) {
+        for (StreamSequence sequence : streamSequenceMap.values()) {
             try {
-                pipeline.init(se);
+                sequence.init(se);
             } catch (Exception e) {
-                log.error(" Error in initializing Stream Pipeline [ "
-                        + pipeline.getName() + "] " + e.getMessage());
+                log.error(" Error in initializing Stream Sequence [ "
+                        + sequence.getName() + "] " + e.getMessage());
             }
         }
 

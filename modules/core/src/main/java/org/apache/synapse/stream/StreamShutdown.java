@@ -40,10 +40,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <h2>Two arms, split on whether anything will redo the work</h2>
  * A <b>resumable</b> run is asked to stop at its next unit boundary; a retry picks it up from the
  * checkpoint. A <b>non-resumable</b> one is left alone to finish, because stopping it destroys work
- * nothing will redo — an API request body cannot be read twice. {@code StreamPipeline} applies that
+ * nothing will redo — an API request body cannot be read twice. {@code StreamSequence} applies that
  * split; this class only carries the signal. See ADR-0037.
  *
- * <p>Static because a shutdown is a property of the server rather than of any one pipeline, and an
+ * <p>Static because a shutdown is a property of the server rather than of any one sequence, and an
  * operator must be able to observe it through the {@code JobContext} it already has, without every
  * caller being taught to pass something new.
  */
@@ -66,7 +66,7 @@ public final class StreamShutdown {
      */
     public static void request() {
         if (requested.compareAndSet(false, true)) {
-            log.info("Stream pipelines asked to stop: " + running.get() + " transfer(s) in flight."
+            log.info("Stream sequences asked to stop: " + running.get() + " transfer(s) in flight."
                     + " Resumable ones stop at their next unit and resume later; the rest run to"
                     + " completion, because nothing would redo them");
         }
@@ -85,13 +85,13 @@ public final class StreamShutdown {
         requested.set(false);
     }
 
-    /** Counts a transfer in. Paired with {@link #ended()} in a finally. */
-    public static void started() {
+    /** Counts a transfer in. Paired with {@link #transferEnded()} in a finally. */
+    public static void transferStarted() {
         running.incrementAndGet();
     }
 
     /** Counts a transfer out, waking anything waiting for quiet. */
-    public static void ended() {
+    public static void transferEnded() {
         if (running.decrementAndGet() <= 0) {
             synchronized (quiet) {
                 quiet.notifyAll();
@@ -108,7 +108,7 @@ public final class StreamShutdown {
      * Waits for in-flight transfers to finish, for at most {@code timeoutMillis}.
      *
      * <p>Returning {@code false} is not a failure. What follows is ordinary termination, which loses at
-     * most the rework already bounded by {@code maxReprocessed} for a resumable run, and for a
+     * most the rework already bounded by {@code checkpointFrequency} for a resumable run, and for a
      * non-resumable one loses what any interrupted mediation loses. The caller should log and carry on
      * rather than escalate.
      *

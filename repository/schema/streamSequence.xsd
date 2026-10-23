@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!--
+  ~  Licensed to the Apache Software Foundation (ASF) under one
+  ~  or more contributor license agreements.  See the NOTICE file
+  ~  distributed with this work for additional information
+  ~  regarding copyright ownership.  The ASF licenses this file
+  ~  to you under the Apache License, Version 2.0 (the
+  ~  "License"); you may not use this file except in compliance
+  ~  with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~  Unless required by applicable law or agreed to in writing,
+  ~  software distributed under the License is distributed on an
+  ~   * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~  KIND, either express or implied.  See the License for the
+  ~  specific language governing permissions and limitations
+  ~  under the License.
+  -->
+
+<!--
+  A stream sequence: an ordered chain of stream operators that moves a byte stream, rather than a
+  list of mediators that processes a MessageContext.
+
+  The three sections carry what this schema exists to check. A stage's ROLE is decidable from its
+  class, so the framework never needed sections to work out what an operator is; CARDINALITY is not
+  decidable from any interface, and that is what an editor can check here, before anything is
+  deployed and without loading a class. See ADR-0068.
+
+  What this schema cannot check, and what therefore still fails at deployment:
+    - that the operator in <source> implements StreamSource. An editor does not load the class.
+    - that an absent <sink> is matched by a last transform declaring materialises().
+  Both are checked in StreamSequence.validate(), at init() for a connector operation.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="qualified"
+           targetNamespace="http://ws.apache.org/ns/synapse"
+           xmlns="http://ws.apache.org/ns/synapse">
+
+    <xs:element name="streamSequence" type="StreamSequence">
+        <xs:annotation>
+            <xs:documentation source="description">
+                A restartable chain of stream operators: source, transforms, sink
+            </xs:documentation>
+        </xs:annotation>
+    </xs:element>
+
+    <xs:complexType name="StreamSequence">
+        <xs:sequence>
+            <xs:element name="description" type="xs:string" minOccurs="0" maxOccurs="1"/>
+
+            <xs:element name="source" type="SingleStage" minOccurs="0" maxOccurs="1">
+                <xs:annotation>
+                    <xs:documentation source="description">
+                        Where the bytes come from: exactly one StreamSource. Omit it when the caller
+                        supplies the stream, as a file inbound endpoint does.
+                    </xs:documentation>
+                </xs:annotation>
+            </xs:element>
+
+            <xs:element name="transforms" type="ManyStages" minOccurs="0" maxOccurs="1">
+                <xs:annotation>
+                    <xs:documentation source="description">
+                        What happens to the bytes on the way: zero or more StreamTransform, in order.
+                    </xs:documentation>
+                </xs:annotation>
+            </xs:element>
+
+            <xs:element name="sink" type="SingleStage" minOccurs="0" maxOccurs="1">
+                <xs:annotation>
+                    <xs:documentation source="description">
+                        Where the bytes end up: exactly one StreamSink. Omit it when the last
+                        transform materialises, and its artifact is the output.
+                    </xs:documentation>
+                </xs:annotation>
+            </xs:element>
+        </xs:sequence>
+
+        <xs:attribute name="name" type="xs:string" use="required"/>
+        <xs:attribute name="sourceIdentity" type="SourceIdentityPolicy" use="optional"/>
+        <xs:attribute name="resume" type="xs:boolean" use="optional"/>
+    </xs:complexType>
+
+    <!--
+      One operator. processContents="lax" because a stage is a connector operation whose element name
+      belongs to that connector - <file.streamRead>, <msazurestorage.blobStreamWrite> - and no schema
+      here can enumerate them. The editor still gets the one rule it could not get from the type
+      system: exactly one.
+    -->
+    <xs:complexType name="SingleStage">
+        <xs:sequence>
+            <xs:any namespace="##any" processContents="lax" minOccurs="1" maxOccurs="1"/>
+        </xs:sequence>
+    </xs:complexType>
+
+    <xs:complexType name="ManyStages">
+        <xs:sequence>
+            <xs:any namespace="##any" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+
+    <xs:simpleType name="SourceIdentityPolicy">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="strict"/>
+            <xs:enumeration value="warn"/>
+            <xs:enumeration value="off"/>
+        </xs:restriction>
+    </xs:simpleType>
+
+</xs:schema>
